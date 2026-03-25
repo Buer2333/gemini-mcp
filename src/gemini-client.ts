@@ -416,6 +416,7 @@ const activeVideoOperations = new Map<string, unknown>()
 export async function startVideoGeneration(
   prompt: string,
   options: {
+    modelOverride?: string
     aspectRatio?: '16:9' | '9:16'
     durationSeconds?: number
     negativePrompt?: string
@@ -423,7 +424,8 @@ export async function startVideoGeneration(
   } = {}
 ): Promise<VideoGenerationResult> {
   try {
-    const { aspectRatio = '16:9', negativePrompt, durationSeconds, referenceImagePaths } = options
+    const { modelOverride, aspectRatio = '16:9', negativePrompt, durationSeconds, referenceImagePaths } = options
+    const modelToUse = modelOverride || videoModelName
 
     logger.prompt(`Video generation: ${prompt}`)
 
@@ -452,8 +454,9 @@ export async function startVideoGeneration(
       logger.info(`Attached ${referenceImagePaths.length} reference image(s) as ASSET (forced 720p)`)
     }
 
+    logger.info(`Using video model: ${modelToUse}`)
     const operation = await genAI.models.generateVideos({
-      model: videoModelName,
+      model: modelToUse,
       prompt,
       config,
     })
@@ -510,6 +513,17 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
           operationName,
           status: 'failed',
           error: typeof status.error === 'object' ? JSON.stringify(status.error) : String(status.error) || 'Unknown error',
+        }
+      }
+
+      // Check for safety filter rejection (video blocked but operation marked done)
+      const filteredCount = status.response?.raiMediaFilteredCount
+      if (filteredCount && (!status.response?.generatedVideos || status.response.generatedVideos.length === 0)) {
+        const reasons = status.response?.raiMediaFilteredReasons?.join('; ') || 'Content filtered by safety system'
+        return {
+          operationName,
+          status: 'failed',
+          error: `Safety filter blocked ${filteredCount} video(s): ${reasons}`,
         }
       }
 

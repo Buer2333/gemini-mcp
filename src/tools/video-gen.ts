@@ -19,6 +19,10 @@ export function registerVideoGenTool(server: McpServer): void {
     'gemini-generate-video',
     {
       prompt: z.string().describe('Description of the video to generate (be detailed!)'),
+      model: z
+        .enum(['standard', 'fast'])
+        .default('fast')
+        .describe('Generation quality: "standard" ($0.40/s, highest quality) or "fast" ($0.15/s, faster & cheaper). Default: fast'),
       aspectRatio: z
         .enum(['16:9', '9:16'])
         .default('16:9')
@@ -28,13 +32,15 @@ export function registerVideoGenTool(server: McpServer): void {
       referenceImagePaths: z
         .array(z.string())
         .optional()
-        .describe('Local file paths to 1-3 reference images. The AI will maintain visual consistency with these images (e.g., product photos, character portraits). Requires Veo 3.0+ model.'),
+        .describe('Local file paths to 1-3 reference images. The AI will maintain visual consistency with these images (e.g., product photos, character portraits). Requires Veo 3.1+ model.'),
     },
-    async ({ prompt, aspectRatio, negativePrompt, durationSeconds, referenceImagePaths }) => {
+    async ({ prompt, model, aspectRatio, negativePrompt, durationSeconds, referenceImagePaths }) => {
       logger.info(`Starting video generation: ${prompt.substring(0, 50)}...`)
 
       try {
+        const modelOverride = model === 'standard' ? 'veo-3.1-generate-preview' : 'veo-3.1-fast-generate-preview'
         const result = await startVideoGeneration(prompt, {
+          modelOverride,
           aspectRatio,
           negativePrompt,
           durationSeconds,
