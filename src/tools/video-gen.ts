@@ -24,14 +24,21 @@ export function registerVideoGenTool(server: McpServer): void {
         .default('16:9')
         .describe('Aspect ratio (16:9 for landscape, 9:16 for portrait/mobile)'),
       negativePrompt: z.string().optional().describe('Things to avoid in the video (e.g., "text, watermarks, blurry")'),
+      durationSeconds: z.number().optional().describe('Video duration in seconds (4, 6, or 8). Default depends on model.'),
+      referenceImagePaths: z
+        .array(z.string())
+        .optional()
+        .describe('Local file paths to 1-3 reference images. The AI will maintain visual consistency with these images (e.g., product photos, character portraits). Requires Veo 3.0+ model.'),
     },
-    async ({ prompt, aspectRatio, negativePrompt }) => {
+    async ({ prompt, aspectRatio, negativePrompt, durationSeconds, referenceImagePaths }) => {
       logger.info(`Starting video generation: ${prompt.substring(0, 50)}...`)
 
       try {
         const result = await startVideoGeneration(prompt, {
           aspectRatio,
           negativePrompt,
+          durationSeconds,
+          referenceImagePaths,
         })
 
         return {

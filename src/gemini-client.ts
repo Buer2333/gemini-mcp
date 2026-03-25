@@ -70,7 +70,7 @@ export async function initGeminiClient(): Promise<void> {
     proModelName = process.env.GEMINI_PRO_MODEL || 'gemini-3-pro-preview'
     flashModelName = process.env.GEMINI_FLASH_MODEL || 'gemini-3-flash-preview'
     imageModelName = process.env.GEMINI_IMAGE_MODEL || 'gemini-3-pro-image-preview'
-    videoModelName = process.env.GEMINI_VIDEO_MODEL || 'veo-2.0-generate-001'
+    videoModelName = process.env.GEMINI_VIDEO_MODEL || 'veo-3.1-generate-preview'
 
     // Set up output directory for generated files (platform-appropriate location)
     outputDir = ensureOutputDir()
@@ -419,10 +419,11 @@ export async function startVideoGeneration(
     aspectRatio?: '16:9' | '9:16'
     durationSeconds?: number
     negativePrompt?: string
+    referenceImagePaths?: string[]
   } = {}
 ): Promise<VideoGenerationResult> {
   try {
-    const { aspectRatio = '16:9', negativePrompt } = options
+    const { aspectRatio = '16:9', negativePrompt, durationSeconds, referenceImagePaths } = options
 
     logger.prompt(`Video generation: ${prompt}`)
 
@@ -431,6 +432,24 @@ export async function startVideoGeneration(
     }
     if (negativePrompt) {
       config.negativePrompt = negativePrompt
+    }
+    if (durationSeconds) {
+      config.durationSeconds = durationSeconds
+    }
+
+    // Build reference images from local file paths (requires Veo 3.1+ or Veo 2.0 exp)
+    if (referenceImagePaths && referenceImagePaths.length > 0) {
+      config.referenceImages = referenceImagePaths.map((filePath) => {
+        const ext = path.extname(filePath).toLowerCase()
+        const mimeType = ext === '.png' ? 'image/png' : 'image/jpeg'
+        const imageBytes = fs.readFileSync(filePath).toString('base64')
+        return {
+          referenceType: 'ASSET',
+          image: { imageBytes, mimeType },
+        }
+      })
+      config.resolution = '720p'
+      logger.info(`Attached ${referenceImagePaths.length} reference image(s) as ASSET (forced 720p)`)
     }
 
     const operation = await genAI.models.generateVideos({
@@ -490,7 +509,7 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
         return {
           operationName,
           status: 'failed',
-          error: String(status.error) || 'Unknown error',
+          error: typeof status.error === 'object' ? JSON.stringify(status.error) : String(status.error) || 'Unknown error',
         }
       }
 
