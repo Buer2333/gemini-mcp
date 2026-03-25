@@ -44,6 +44,7 @@ export type ImageSize = '1K' | '2K' | '4K'
 
 // Global clients (exported for use by other modules)
 export let genAI: GoogleGenAI
+let videoGenAI: GoogleGenAI // Separate client for video generation (may use different API key)
 let proModelName: string
 let flashModelName: string
 let imageModelName: string
@@ -65,6 +66,14 @@ export async function initGeminiClient(): Promise<void> {
   try {
     // Initialize the API client
     genAI = new GoogleGenAI({ apiKey })
+
+    // Video generation can use a separate paid API key (GEMINI_VIDEO_API_KEY)
+    // Falls back to the main key if not set
+    const videoApiKey = process.env.GEMINI_VIDEO_API_KEY || apiKey
+    videoGenAI = new GoogleGenAI({ apiKey: videoApiKey })
+    if (process.env.GEMINI_VIDEO_API_KEY) {
+      logger.info('Using separate API key for video generation')
+    }
 
     // Set up models - Gemini 3 defaults (latest preview)
     proModelName = process.env.GEMINI_PRO_MODEL || 'gemini-3-pro-preview'
@@ -455,7 +464,7 @@ export async function startVideoGeneration(
     }
 
     logger.info(`Using video model: ${modelToUse}`)
-    const operation = await genAI.models.generateVideos({
+    const operation = await videoGenAI.models.generateVideos({
       model: modelToUse,
       prompt,
       config,
@@ -497,7 +506,7 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
     }
 
     // Poll for updated status
-    const status = await genAI.operations.getVideosOperation({
+    const status = await videoGenAI.operations.getVideosOperation({
       operation: operation as never,
     })
 
@@ -541,7 +550,7 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
           // Fetch the video with API key in header
           const response = await fetch(videoUri, {
             headers: {
-              'x-goog-api-key': process.env.GEMINI_API_KEY || '',
+              'x-goog-api-key': process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || '',
             },
           })
 
