@@ -328,10 +328,14 @@ export async function generateImage(
       config.tools = [{ googleSearch: {} }]
     }
 
-    // Add thinking config - defaults to high via env var or parameter
-    const effectiveThinkingLevel = thinkingLevel ?? (process.env.GEMINI_IMAGE_THINKING_LEVEL as ThinkingLevel) ?? 'high'
-    config.thinkingConfig = { thinkingLevel: effectiveThinkingLevel }
-    logger.debug(`Using thinking level: ${effectiveThinkingLevel}`)
+    // Add thinking config only if the model supports it (image-preview models do NOT support thinking)
+    if (!imageModelName.includes('image-preview')) {
+      const effectiveThinkingLevel = thinkingLevel ?? (process.env.GEMINI_IMAGE_THINKING_LEVEL as ThinkingLevel) ?? 'high'
+      config.thinkingConfig = { thinkingLevel: effectiveThinkingLevel }
+      logger.debug(`Using thinking level: ${effectiveThinkingLevel}`)
+    } else {
+      logger.debug('Skipping thinking config — image-preview model does not support it')
+    }
 
     // Add person generation control if specified
     if (personGeneration) {
@@ -343,11 +347,30 @@ export async function generateImage(
       config.seed = seed
     }
 
-    const response = await genAI.models.generateContent({
-      model: imageModelName,
-      contents: fullPrompt,
-      config,
-    })
+    let response
+    try {
+      response = await genAI.models.generateContent({
+        model: imageModelName,
+        contents: fullPrompt,
+        config,
+      })
+    } catch (primaryError: unknown) {
+      // Fallback to paid key on quota exhaustion (429)
+      const fallbackKey = process.env.GEMINI_FALLBACK_API_KEY
+      const errMsg = primaryError instanceof Error ? primaryError.message : String(primaryError)
+      if (fallbackKey && (errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED'))) {
+        logger.info('Primary key quota exhausted, falling back to paid key...')
+        const { GoogleGenAI: FallbackGenAI } = await import('@google/genai')
+        const fallbackGenAI = new FallbackGenAI({ apiKey: fallbackKey })
+        response = await fallbackGenAI.models.generateContent({
+          model: imageModelName,
+          contents: fullPrompt,
+          config,
+        })
+      } else {
+        throw primaryError
+      }
+    }
 
     // Extract image from response
     const candidates = response.candidates
