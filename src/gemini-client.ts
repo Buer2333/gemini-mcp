@@ -45,6 +45,7 @@ export type ImageSize = '1K' | '2K' | '4K'
 // Global clients (exported for use by other modules)
 export let genAI: GoogleGenAI
 let videoGenAI: GoogleGenAI // Separate client for video generation (may use different API key)
+let videoFallbackGenAI: GoogleGenAI | null = null // Fallback client for video when primary hits quota
 let proModelName: string
 let flashModelName: string
 let imageModelName: string
@@ -73,6 +74,13 @@ export async function initGeminiClient(): Promise<void> {
     videoGenAI = new GoogleGenAI({ apiKey: videoApiKey })
     if (process.env.GEMINI_VIDEO_API_KEY) {
       logger.info('Using separate API key for video generation')
+    }
+
+    // Video fallback key for quota exhaustion (doubles daily video quota)
+    const videoFallbackKey = process.env.GEMINI_FALLBACK_API_KEY
+    if (videoFallbackKey && videoFallbackKey !== videoApiKey) {
+      videoFallbackGenAI = new GoogleGenAI({ apiKey: videoFallbackKey })
+      logger.info('Video fallback key configured (will activate on quota exhaustion)')
     }
 
     // Set up models - Gemini 3 defaults (latest preview)
@@ -440,6 +448,8 @@ export interface VideoGenerationResult {
 
 // Store active video operations for polling
 const activeVideoOperations = new Map<string, unknown>()
+// Track which client was used per operation (for fallback key status polling)
+const operationClientMap = new Map<string, GoogleGenAI>()
 
 /**
  * Start video generation using Gemini's Veo model
@@ -487,18 +497,38 @@ export async function startVideoGeneration(
     }
 
     logger.info(`Using video model: ${modelToUse}`)
-    const operation = await videoGenAI.models.generateVideos({
-      model: modelToUse,
-      prompt,
-      config,
-    })
+
+    let operation
+    let usedClient = videoGenAI
+    try {
+      operation = await videoGenAI.models.generateVideos({
+        model: modelToUse,
+        prompt,
+        config,
+      })
+    } catch (primaryError: unknown) {
+      // Fallback to second key on quota exhaustion (doubles daily quota)
+      const errMsg = primaryError instanceof Error ? primaryError.message : String(primaryError)
+      if (videoFallbackGenAI && (errMsg.includes('429') || errMsg.includes('RESOURCE_EXHAUSTED'))) {
+        logger.info('Video primary key quota exhausted, falling back to second key...')
+        operation = await videoFallbackGenAI.models.generateVideos({
+          model: modelToUse,
+          prompt,
+          config,
+        })
+        usedClient = videoFallbackGenAI
+      } else {
+        throw primaryError
+      }
+    }
 
     const operationName = operation.name || `video-${Date.now()}`
 
-    // Store the full operation object for later polling
+    // Store the full operation object and which client was used for later polling
     activeVideoOperations.set(operationName, operation)
+    operationClientMap.set(operationName, usedClient)
 
-    logger.info(`Video generation started: ${operationName}`)
+    logger.info(`Video generation started: ${operationName}${usedClient !== videoGenAI ? ' (fallback key)' : ''}`)
 
     return {
       operationName,
@@ -528,8 +558,12 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
       }
     }
 
+    // Use the same client that started this operation
+    const client = operationClientMap.get(operationName) || videoGenAI
+    const usedFallback = operationClientMap.get(operationName) === videoFallbackGenAI
+
     // Poll for updated status
-    const status = await videoGenAI.operations.getVideosOperation({
+    const status = await client.operations.getVideosOperation({
       operation: operation as never,
     })
 
@@ -537,8 +571,9 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
     activeVideoOperations.set(operationName, status)
 
     if (status.done) {
-      // Clean up stored operation
+      // Clean up stored operation and client tracking
       activeVideoOperations.delete(operationName)
+      operationClientMap.delete(operationName)
 
       if (status.error) {
         return {
@@ -570,10 +605,13 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
         filePath = path.join(outputDir, filename)
 
         try {
-          // Fetch the video with API key in header
+          // Fetch the video with the API key that generated it
+          const downloadKey = usedFallback
+            ? (process.env.GEMINI_FALLBACK_API_KEY || process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || '')
+            : (process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || '')
           const response = await fetch(videoUri, {
             headers: {
-              'x-goog-api-key': process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || '',
+              'x-goog-api-key': downloadKey,
             },
           })
 
