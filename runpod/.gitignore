@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Generated test/preview outputs from local smoke runs
+*.webp
+*.mp4
