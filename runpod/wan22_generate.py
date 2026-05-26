@@ -25,6 +25,27 @@ import uuid
 
 import requests
 
+# --- Proxy bypass (2026-05-26) ---------------------------------------------
+# RunPod endpoints (api.runpod.io + *-PORT.proxy.runpod.net) are directly reachable
+# from the operator host (verified: direct curl /system_stats -> HTTP 200). A local
+# HTTP(S)_PROXY (e.g. Clash Verge at 127.0.0.1:7897) is therefore an unnecessary
+# middleman that transiently drops long-poll connections — observed mid-FLF2V as
+# `ProxyError: RemoteDisconnected` on /history after ~16min, crashing the driver while
+# the pod-side gen kept running. Stripping proxy env makes every requests.* call here
+# ignore the env proxy (== trust_env=False, applied process-wide). NOTE: only affects
+# THIS local process; the embedded pod-side auto_stop script (an f-string literal) and
+# its localhost calls are untouched.
+for _pv in (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+):
+    os.environ.pop(_pv, None)
+# ---------------------------------------------------------------------------
+
 # Optional: unified AI-gen logger (sidecar JSON + index).
 # Soft import so the script runs even if the logger lib is missing.
 try:
@@ -332,7 +353,14 @@ def upload_image(image_path):
 
 
 def build_workflow(
-    prompt, negative_prompt, image_name, preset, seed, lora_strength, single_model=False
+    prompt,
+    negative_prompt,
+    image_name,
+    preset,
+    seed,
+    lora_strength,
+    single_model=False,
+    end_image_name=None,
 ):
     p = PRESETS[preset]
     half_steps = p["steps"] // 2
@@ -412,6 +440,15 @@ def build_workflow(
             },
         },
     }
+
+    # FLF2V (first-last-frame): anchor the morph to end on a clean target frame.
+    # WanVideoImageToVideoEncode supports end_image; end_latent_strength=1.0 already set above.
+    if end_image_name:
+        workflow["5b"] = {
+            "class_type": "LoadImage",
+            "inputs": {"image": end_image_name},
+        }
+        workflow["8"]["inputs"]["end_image"] = ["5b", 0]
 
     if single_model:
         # Single model: use high_noise for ALL steps (avoids 14GB model swap deadlock)
@@ -552,6 +589,7 @@ def generate(
     lora_strength=0.8,
     negative_prompt="blurry, low quality, watermark, text, distorted, ugly, deformed",
     single_model=False,
+    end_image_path=None,
 ):
     if seed is None:
         seed = int(time.time()) % 2**32
@@ -568,9 +606,22 @@ def generate(
     image_name = upload_image(image_path)
     print(f"  Uploaded: {image_name}")
 
+    end_image_name = None
+    if end_image_path:
+        print("Uploading end image (FLF2V)...")
+        end_image_name = upload_image(end_image_path)
+        print(f"  Uploaded end: {end_image_name}")
+
     # Build and submit
     workflow = build_workflow(
-        prompt, negative_prompt, image_name, mode, seed, lora_strength, single_model
+        prompt,
+        negative_prompt,
+        image_name,
+        mode,
+        seed,
+        lora_strength,
+        single_model,
+        end_image_name=end_image_name,
     )
     client_id = str(uuid.uuid4())
     r = requests.post(
@@ -725,7 +776,13 @@ while True:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Wan 2.2 I2V Generator via RunPod")
     parser.add_argument("--prompt", "-p", help="Positive prompt")
-    parser.add_argument("--image", "-i", help="Reference image path")
+    parser.add_argument("--image", "-i", help="Reference image path (start frame)")
+    parser.add_argument(
+        "--end-image",
+        "-e",
+        default=None,
+        help="Optional end frame for FLF2V (first-last-frame). Anchors the morph to end on this image.",
+    )
     parser.add_argument(
         "--mode", "-m", default="test", choices=["test", "mid", "hd", "prod"]
     )
@@ -801,6 +858,7 @@ if __name__ == "__main__":
             args.lora_strength,
             args.negative,
             args.single_model,
+            args.end_image,
         )
         if result:
             downloaded = download_output(result["filename"], args.output_dir)
