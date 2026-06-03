@@ -31,10 +31,19 @@ import requests
 # HTTP(S)_PROXY (e.g. Clash Verge at 127.0.0.1:7897) is therefore an unnecessary
 # middleman that transiently drops long-poll connections — observed mid-FLF2V as
 # `ProxyError: RemoteDisconnected` on /history after ~16min, crashing the driver while
-# the pod-side gen kept running. Stripping proxy env makes every requests.* call here
-# ignore the env proxy (== trust_env=False, applied process-wide). NOTE: only affects
-# THIS local process; the embedded pod-side auto_stop script (an f-string literal) and
-# its localhost calls are untouched.
+# the pod-side gen kept running.
+#
+# ROOT CAUSE (2026-06-02 correction): popping the proxy env vars is NOT enough on macOS.
+# `requests` (trust_env=True default) resolves proxies via urllib `getproxies()`, which
+# on macOS ALSO reads the *system* network proxy (System Settings / scutil) — Clash Verge
+# sets itself there too. So env-pop alone still let requests pick up the system proxy and
+# intermittently drop (observed 2026-06-02: morph OK, bounce ProxyError mid-run). The old
+# "== trust_env=False" claim was wrong for the macOS sysconf path.
+#
+# FIX: also set NO_PROXY for the RunPod domains. requests' should_bypass_proxies() matches
+# NO_PROXY first and returns {} for those hosts — bypassing BOTH env and macOS system proxy.
+# NOTE: only affects THIS local process; the embedded pod-side auto_stop script (an
+# f-string literal) and its localhost calls are untouched.
 for _pv in (
     "HTTP_PROXY",
     "HTTPS_PROXY",
@@ -44,6 +53,9 @@ for _pv in (
     "all_proxy",
 ):
     os.environ.pop(_pv, None)
+# Force-bypass the system proxy (macOS sysconf) for RunPod + localhost.
+_NO_PROXY = "runpod.net,runpod.io,127.0.0.1,localhost"
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = _NO_PROXY
 # ---------------------------------------------------------------------------
 
 # Optional: unified AI-gen logger (sidecar JSON + index).
@@ -636,9 +648,13 @@ def generate(
     prompt_id = result["prompt_id"]
     print(f"Submitted: {prompt_id}")
 
-    # Poll
+    # Poll. range(120)*10s≈1330s was too short for slower 48GB cards: v1 on RTX 6000
+    # Ada finished morph at 1258s (barely under), but L40 prod exceeded it -> Timeout
+    # returned None while the pod-side gen kept running (2026-06-02 loss). Bumped to
+    # ~42min window; env POLL_ROUNDS overrides. Gen still safe on NV /workspace if this
+    # ever trips again — recover via scp before terminate.
     t0 = time.time()
-    for i in range(120):
+    for i in range(int(os.environ.get("POLL_ROUNDS", "240"))):
         time.sleep(10)
         try:
             h = (
