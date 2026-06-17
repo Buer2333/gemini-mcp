@@ -125,6 +125,17 @@ For CLI mode, run: gemini --help
     logger.error('STDIN error:', err)
   })
 
+  // stdin EOF/close = parent pipe gone. Exit immediately so a dead pipe never
+  // gets polled in a busy-loop and the process never lingers as an orphan.
+  process.stdin.on('end', () => {
+    logger.warn('STDIN closed (EOF) — exiting')
+    process.exit(0)
+  })
+  process.stdin.on('close', () => {
+    logger.warn('STDIN closed — exiting')
+    process.exit(0)
+  })
+
   process.stdout.on('error', (err) => {
     logger.error('STDOUT error:', err)
   })
@@ -171,51 +182,13 @@ For CLI mode, run: gemini --help
     // Start server with stdio transport
     const transport = new StdioServerTransport()
 
-    // Set up error handling for transport
+    // Transport close = parent (Claude) gone. For a stdio server the stdin
+    // pipe cannot be reconnected, so exit instead of looping — the previous
+    // reconnect-with-backoff left orphaned processes (PPID=1) busy-looping on
+    // the dead stdin fd at ~85% CPU. See task T-20260617-001.
     transport.onclose = () => {
-      logger.warn('MCP transport connection closed')
-      logger.debug('Connection closed event triggered')
-
-      // Attempt to recover connection with backoff strategy
-      let reconnectAttempts = 0
-      const maxReconnectAttempts = 5
-
-      const attemptReconnect = () => {
-        if (reconnectAttempts >= maxReconnectAttempts) {
-          logger.error(`Failed to reconnect after ${maxReconnectAttempts} attempts`)
-          return
-        }
-
-        reconnectAttempts++
-        const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), 10000)
-
-        logger.info(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts}) after ${delay}ms...`)
-
-        setTimeout(() => {
-          try {
-            if (process.stdin.destroyed || process.stdout.destroyed) {
-              logger.error('Cannot reconnect: stdin or stdout is destroyed')
-              return
-            }
-
-            server
-              .connect(transport)
-              .then(() => {
-                logger.info('Successfully reconnected to MCP transport')
-                reconnectAttempts = 0
-              })
-              .catch((e) => {
-                logger.error('Reconnection failed:', e)
-                attemptReconnect()
-              })
-          } catch (e) {
-            logger.error('Error during reconnection attempt:', e)
-            attemptReconnect()
-          }
-        }, delay)
-      }
-
-      attemptReconnect()
+      logger.warn('MCP transport closed (parent gone) — exiting')
+      process.exit(0)
     }
 
     transport.onerror = (error) => {
