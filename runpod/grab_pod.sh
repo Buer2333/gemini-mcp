@@ -47,7 +47,18 @@ for i in $(seq 1 "$MAX_ROUNDS"); do
     fi
   done <<< "$GPU_LIST"
   echo "round $i/$MAX_ROUNDS: all dry, sleep 90s ($(date '+%H:%M:%S'))"
+  # stall 主动上报（2026-06-12 固化，dip_demo pilot acceptance 工程项）：每 10 轮干涸推一次飞书，
+  # 防"机器自治退化成机器沉默"（2026-06-11 US-KS-2 库存墙用户被迫两次来问的教训）。
+  # FEISHU_WEBHOOK_URL 未设则静默跳过，不影响原行为。
+  if [ $((i % 10)) -eq 0 ] && [ -n "${FEISHU_WEBHOOK_URL:-}" ]; then
+    curl -s -m 10 -X POST "$FEISHU_WEBHOOK_URL" -H "Content-Type: application/json" \
+      -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"⏳ grab_pod stall: ${i}/${MAX_ROUNDS} 轮全 GPU 干涸 (~$((i*90/60))min)。剩余 $((MAX_ROUNDS-i)) 轮 (~$(( (MAX_ROUNDS-i)*90/60 ))min)。备选: 等美国凌晨窗口 / 换 DC / MAX_ROUNDS 调大。pod 未建零成本。\"}}" >/dev/null || true
+  fi
   sleep 90
 done
 echo "EXHAUSTED: no stock after $MAX_ROUNDS rounds"
+if [ -n "${FEISHU_WEBHOOK_URL:-}" ]; then
+  curl -s -m 10 -X POST "$FEISHU_WEBHOOK_URL" -H "Content-Type: application/json" \
+    -d "{\"msg_type\":\"text\",\"content\":{\"text\":\"🔴 grab_pod EXHAUSTED: ${MAX_ROUNDS} 轮无库存，已停止（零成本）。需人工决策: 换时段 / 换 DC / 第二 NV。\"}}" >/dev/null || true
+fi
 exit 1

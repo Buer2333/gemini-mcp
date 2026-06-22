@@ -65,17 +65,12 @@ export function registerImageEditTool(server: McpServer): void {
       thinkingLevel: z
         .enum(['minimal', 'low', 'medium', 'high'])
         .optional()
-        .describe(
-          'Reasoning depth for image generation. Defaults to high if not set.'
-        ),
+        .describe('Reasoning depth for image generation. Defaults to high if not set.'),
       personGeneration: z
         .enum(['ALLOW_ALL', 'ALLOW_ADULT', 'ALLOW_NONE'])
         .optional()
         .describe('Control generation of people in images.'),
-      seed: z
-        .number()
-        .optional()
-        .describe('Seed for reproducible results.'),
+      seed: z.number().optional().describe('Seed for reproducible results.'),
     },
     async ({ prompt, aspectRatio, imageSize, useGoogleSearch, thinkingLevel, personGeneration, seed }) => {
       logger.info(`Starting image edit session: ${prompt.substring(0, 50)}...`)

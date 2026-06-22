@@ -338,7 +338,8 @@ export async function generateImage(
 
     // Add thinking config only if the model supports it (image-preview models do NOT support thinking)
     if (!imageModelName.includes('image-preview')) {
-      const effectiveThinkingLevel = thinkingLevel ?? (process.env.GEMINI_IMAGE_THINKING_LEVEL as ThinkingLevel) ?? 'high'
+      const effectiveThinkingLevel =
+        thinkingLevel ?? (process.env.GEMINI_IMAGE_THINKING_LEVEL as ThinkingLevel) ?? 'high'
       config.thinkingConfig = { thinkingLevel: effectiveThinkingLevel }
       logger.debug(`Using thinking level: ${effectiveThinkingLevel}`)
     } else {
@@ -579,7 +580,8 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
         return {
           operationName,
           status: 'failed',
-          error: typeof status.error === 'object' ? JSON.stringify(status.error) : String(status.error) || 'Unknown error',
+          error:
+            typeof status.error === 'object' ? JSON.stringify(status.error) : String(status.error) || 'Unknown error',
         }
       }
 
@@ -607,8 +609,11 @@ export async function checkVideoStatus(operationName: string): Promise<VideoGene
         try {
           // Fetch the video with the API key that generated it
           const downloadKey = usedFallback
-            ? (process.env.GEMINI_FALLBACK_API_KEY || process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || '')
-            : (process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || '')
+            ? process.env.GEMINI_FALLBACK_API_KEY ||
+              process.env.GEMINI_VIDEO_API_KEY ||
+              process.env.GEMINI_API_KEY ||
+              ''
+            : process.env.GEMINI_VIDEO_API_KEY || process.env.GEMINI_API_KEY || ''
           const response = await fetch(videoUri, {
             headers: {
               'x-goog-api-key': downloadKey,
