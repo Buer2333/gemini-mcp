@@ -44,11 +44,14 @@ deploy() {
 classify() {
   printf '%s' "$1" | python3 -c '
 import sys, json
-raw = sys.stdin.read()
+raw = sys.stdin.read().strip()
+if not raw:
+    # empty body = network blip / curl reached nothing — transient, retry (do NOT abort).
+    print("TRANSIENT|empty response (network blip)"); sys.exit()
 try:
     d = json.loads(raw)
 except Exception:
-    print("ERR|unparseable response: " + raw[:200]); sys.exit()
+    print("TRANSIENT|unparseable response (likely network/proxy blip): " + raw[:160]); sys.exit()
 if isinstance(d, dict) and d.get("id"):
     print("OK|" + d["id"]); sys.exit()
 msg = ""
@@ -99,6 +102,8 @@ for i in $(seq 1 "$MAX_ROUNDS"); do
         exit 0 ;;
       STOCK)
         : ;;  # genuine no-stock — try next GPU / next round
+      TRANSIENT)
+        echo "  [transient] $detail — retrying" ;;  # network blip — retry, don't abort
       BALANCE)
         echo "ABORT|BALANCE|$detail"
         alert "🔴 grab_pod ABORT: 余额不足，无法租 pod。请充值。detail: $detail"
