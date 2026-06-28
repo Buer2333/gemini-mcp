@@ -373,9 +373,15 @@ def build_workflow(
     lora_strength,
     single_model=False,
     end_image_name=None,
+    num_frames_override=None,
 ):
     p = PRESETS[preset]
     half_steps = p["steps"] // 2
+    # right-size frame count (2026-06-25): render only the frames a segment needs
+    # instead of the preset's fixed 81 — Wan render time scales ~linearly with
+    # num_frames, so 48-frame transform / 24-frame intake cut RunPod time a lot
+    # without touching prod quality (same MoE, no lightx2v). Falls back to preset.
+    nf = num_frames_override if num_frames_override else p["num_frames"]
 
     workflow = {
         # High noise model (always loaded)
@@ -432,7 +438,7 @@ def build_workflow(
             "inputs": {
                 "width": p["width"],
                 "height": p["height"],
-                "num_frames": p["num_frames"],
+                "num_frames": nf,
                 "noise_aug_strength": 0.0,
                 "start_latent_strength": 1.0,
                 "end_latent_strength": 1.0,
@@ -602,6 +608,7 @@ def generate(
     negative_prompt="blurry, low quality, watermark, text, distorted, ugly, deformed",
     single_model=False,
     end_image_path=None,
+    num_frames=None,
 ):
     if seed is None:
         seed = int(time.time()) % 2**32
@@ -634,6 +641,7 @@ def generate(
         lora_strength,
         single_model,
         end_image_name=end_image_name,
+        num_frames_override=num_frames,
     )
     client_id = str(uuid.uuid4())
     r = requests.post(
@@ -835,6 +843,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Do NOT stop pod after generation (default: stop pod to prevent runaway cost)",
     )
+    parser.add_argument(
+        "--num-frames",
+        type=int,
+        default=None,
+        help="Override preset frame count (e.g. 24/48) to right-size a segment and cut "
+        "render time; defaults to the mode preset (prod=81). Keeps prod quality.",
+    )
     args = parser.parse_args()
 
     if args.status:
@@ -857,10 +872,18 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
-    # Ensure pod is running
+    # Ensure pod is running AND ComfyUI is actually serving.
+    # A freshly-deployed pod (grab_pod.sh / REST create) reports RUNNING
+    # immediately but the base pytorch image does NOT auto-launch ComfyUI
+    # (it lives on the NV at /workspace/ComfyUI). Without this, generate()
+    # hits upload_image against a dead :8188 → empty body → JSONDecodeError.
+    # ensure_comfyui_running() is idempotent (no-op if already serving).
     if pod_status() != "RUNNING":
         if not start_pod():
             sys.exit(1)
+    else:
+        ensure_comfyui_running()
+        wait_for_comfyui_ready(timeout=180)
 
     # Deploy auto-stop as backup safety net (won't replace post-gen stop)
     ensure_auto_stop(idle_minutes=10)
@@ -875,6 +898,7 @@ if __name__ == "__main__":
             args.negative,
             args.single_model,
             args.end_image,
+            num_frames=args.num_frames,
         )
         if result:
             downloaded = download_output(result["filename"], args.output_dir)
