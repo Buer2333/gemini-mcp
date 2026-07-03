@@ -61,7 +61,7 @@ os.environ["NO_PROXY"] = os.environ["no_proxy"] = _NO_PROXY
 # Optional: unified AI-gen logger (sidecar JSON + index).
 # Soft import so the script runs even if the logger lib is missing.
 try:
-    sys.path.insert(0, os.path.expanduser("~/Shining/.claude/lib"))
+    sys.path.insert(0, os.path.expanduser("~/claude-dev/libs/claude-helpers"))
     from ai_gen_logger import log_generation as _log_generation  # type: ignore
 except Exception:
     _log_generation = None
