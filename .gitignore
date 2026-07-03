@@ -37,3 +37,4 @@ gemini-output/
 
 # MCP Registry tokens
 .mcpregistry_*
+.venv/
