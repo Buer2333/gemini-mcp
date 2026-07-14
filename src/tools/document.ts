@@ -37,6 +37,15 @@ function getMimeType(filePath: string): string {
     '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     '.ppt': 'application/vnd.ms-powerpoint',
     '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+    // Video (Gemini Files API accepts these for native multimodal analysis /
+    // video reverse-prompting; added 2026-07-13 — see video-reverse-prompt skill)
+    '.mp4': 'video/mp4',
+    '.mov': 'video/quicktime',
+    '.webm': 'video/webm',
+    '.m4v': 'video/x-m4v',
+    '.mpeg': 'video/mpeg',
+    '.mpg': 'video/mpeg',
+    '.avi': 'video/x-msvideo',
   }
   return mimeTypes[ext] || 'application/octet-stream'
 }
