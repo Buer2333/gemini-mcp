@@ -146,8 +146,8 @@ bun run lint       # Lint code with ESLint
 
 ## Dependencies
 
-- `@google/genai`: ^1.34.0 - Google Generative AI SDK
-- `@modelcontextprotocol/sdk`: 1.22.0 - MCP SDK (pinned; 1.23.0+ causes TypeScript OOM)
+- `@google/genai`: ^2.12.0 - Google Generative AI SDK (v2 required since 2026-05: the legacy Interactions API schema was retired, so Deep Research 400s on v1.x. v2 renamed the interaction's `outputs` array to `steps`; parsing lives in `src/utils/interaction-parse.ts`. Its peer dep asks for MCP SDK ^1.25.2 — deliberately left unmet, see below.)
+- `@modelcontextprotocol/sdk`: 1.22.0 - MCP SDK (pinned; 1.23.0+ causes TypeScript OOM. `@google/genai` v2 declares a peer dep of ^1.25.2 — left unmet on purpose; that peer is only used by genai's own MCP tool bindings, which this server does not call. Typecheck/tests/live Deep Research all pass with the pin, so do not "fix" the peer warning by bumping.)
 - `zod`: 3.24.3 - Schema validation (pinned for compatibility with MCP SDK)
 - `zod-to-json-schema`: 3.24.5 - Zod to JSON Schema conversion (pinned; 3.25+ requires zod/v3 export)
 

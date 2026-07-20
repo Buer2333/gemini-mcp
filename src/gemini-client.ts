@@ -13,6 +13,7 @@
 import { GoogleGenAI, Modality } from '@google/genai'
 import { logger } from './utils/logger.js'
 import { ensureOutputDir } from './utils/output-dir.js'
+import { extractInteractionText, mapInteractionStatus } from './utils/interaction-parse.js'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -733,7 +734,9 @@ export async function checkDeepResearch(researchId: string): Promise<DeepResearc
 
     const status = interaction.status || 'unknown'
 
-    if (status === 'completed') {
+    const mappedStatus = mapInteractionStatus(status)
+
+    if (mappedStatus === 'completed') {
       // Save the FULL raw response to the output directory
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-')
       const outputPath = path.join(getOutputDir(), `deep-research-${timestamp}.json`)
@@ -743,16 +746,14 @@ export async function checkDeepResearch(researchId: string): Promise<DeepResearc
         created: interaction.created,
         agent: interaction.agent,
         model: interaction.model,
-        outputs: interaction.outputs,
+        steps: interaction.steps,
         rawInteraction: interaction,
       }
       fs.writeFileSync(outputPath, JSON.stringify(fullResponse, null, 2))
       logger.info(`Full deep research response saved to: ${outputPath}`)
 
       // Extract text for the summary (but full data is saved)
-      const textOutputs = (interaction.outputs || [])
-        .filter((output) => 'type' in output && output.type === 'text')
-        .map((output) => ({ text: (output as { text?: string }).text }))
+      const textOutputs = extractInteractionText(interaction).map((text) => ({ text }))
 
       return {
         id: researchId,
@@ -760,11 +761,11 @@ export async function checkDeepResearch(researchId: string): Promise<DeepResearc
         outputs: textOutputs,
         savedPath: outputPath,
       }
-    } else if (status === 'failed' || status === 'cancelled') {
+    } else if (mappedStatus === 'failed') {
       return {
         id: researchId,
         status: 'failed',
-        error: 'Research task failed or was cancelled',
+        error: `Research task ended with status: ${status}`,
       }
     }
 
@@ -789,12 +790,8 @@ export async function followUpResearch(researchId: string, question: string): Pr
       previous_interaction_id: researchId,
     })
 
-    // Extract text from TextContent outputs
-    const outputs = interaction.outputs || []
-    const textOutputs = outputs
-      .filter((output) => 'type' in output && output.type === 'text')
-      .map((output) => (output as { text?: string }).text)
-      .filter((text): text is string => !!text)
+    // Extract text from the model_output steps
+    const textOutputs = extractInteractionText(interaction)
 
     if (textOutputs.length > 0) {
       return textOutputs[textOutputs.length - 1]
