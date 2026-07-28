@@ -364,6 +364,18 @@ def upload_image(image_path):
     raise RuntimeError(f"Upload failed after 3 attempts: {last_err}")
 
 
+# morph 段 LoRA 选择（2026-07-16 T-20260712-001 M1 矩阵）。默认 slop_bounce 保持产线现行为。
+# high/low 成对（Wan2.2 双专家）。文件须先在 NV loras/ 就位（见 M1-runpod-protocol.md §1b）。
+MORPH_LORAS = {
+    "slop_bounce": ("slop_bounce_high.safetensors", "slop_bounce_low.safetensors"),
+    "disintegration": (
+        "[Wan2.2]Disintegration_Redmond_high_noise.safetensors",
+        "[Wan2.2]Disintegration_Redmond_low_noise.safetensors",
+    ),
+    # M1 臂A(无LoRA基线)=任选一项 + --lora-strength 0；臂C Muscle(Wan2.1单侧)待实际文件名补
+}
+
+
 def build_workflow(
     prompt,
     negative_prompt,
@@ -374,7 +386,9 @@ def build_workflow(
     single_model=False,
     end_image_name=None,
     num_frames_override=None,
+    morph_lora="slop_bounce",
 ):
+    _lora_hi, _lora_lo = MORPH_LORAS.get(morph_lora, MORPH_LORAS["slop_bounce"])
     p = PRESETS[preset]
     half_steps = p["steps"] // 2
     # right-size frame count (2026-06-25): render only the frames a segment needs
@@ -452,7 +466,7 @@ def build_workflow(
         "9h": {
             "class_type": "WanVideoLoraSelect",
             "inputs": {
-                "lora": "slop_bounce_high.safetensors",
+                "lora": _lora_hi,
                 "strength": lora_strength,
                 "merge_loras": False,
             },
@@ -503,7 +517,7 @@ def build_workflow(
         workflow["9l"] = {
             "class_type": "WanVideoLoraSelect",
             "inputs": {
-                "lora": "slop_bounce_low.safetensors",
+                "lora": _lora_lo,
                 "strength": lora_strength,
                 "merge_loras": False,
             },
@@ -609,6 +623,7 @@ def generate(
     single_model=False,
     end_image_path=None,
     num_frames=None,
+    morph_lora="slop_bounce",
 ):
     if seed is None:
         seed = int(time.time()) % 2**32
@@ -642,6 +657,7 @@ def generate(
         single_model,
         end_image_name=end_image_name,
         num_frames_override=num_frames,
+        morph_lora=morph_lora,
     )
     client_id = str(uuid.uuid4())
     r = requests.post(
@@ -813,6 +829,12 @@ if __name__ == "__main__":
     parser.add_argument("--seed", "-s", type=int, default=None)
     parser.add_argument("--lora-strength", "-l", type=float, default=0.8)
     parser.add_argument(
+        "--morph-lora",
+        default="slop_bounce",
+        choices=list(MORPH_LORAS.keys()),
+        help="morph 段 LoRA（默认 slop_bounce=产线现行为；M1 测 disintegration）",
+    )
+    parser.add_argument(
         "--negative",
         "-n",
         default="blurry, low quality, watermark, text, distorted, ugly, deformed",
@@ -844,6 +866,12 @@ if __name__ == "__main__":
         help="Do NOT stop pod after generation (default: stop pod to prevent runaway cost)",
     )
     parser.add_argument(
+        "--skip-skin-gate",
+        action="store_true",
+        help="Bypass the FLF2V skin-tone gate (for non-skin paired refs: organ "
+        "interiors, deliberate luminance changes). Skin variants must not skip.",
+    )
+    parser.add_argument(
         "--num-frames",
         type=int,
         default=None,
@@ -872,6 +900,29 @@ if __name__ == "__main__":
         parser.print_help()
         sys.exit(1)
 
+    # Skin-tone numeric gate for FLF2V paired refs (来源：painpoint-factory SSOT §4b).
+    # Paired before/after with mismatched skin luminance (Δ>10) morphs into a
+    # full-clip skin drift that post-hoc color transfer cannot fix — reject
+    # before spending GPU money. Non-skin FLF2V (organ interiors, faces with
+    # deliberate luminance change) must pass --skip-skin-gate explicitly.
+    if args.end_image and not args.skip_skin_gate:
+        _gate = os.path.expanduser(
+            "~/claude-dev/projects/health-supplements/projects/"
+            "ai-generation-workspace/workspace/scripts/skin_gate.py"
+        )
+        if os.path.exists(_gate):
+            import subprocess
+
+            _rc = subprocess.call([sys.executable, _gate, args.image, args.end_image])
+            if _rc != 0:
+                print(
+                    "[skin-gate] FAIL: before/after 皮肤亮度差超闸。配对 refs 须成对"
+                    "重生（SSOT §4b）；非皮肤类 FLF2V 加 --skip-skin-gate 显式豁免。"
+                )
+                sys.exit(1)
+        else:
+            print(f"[skin-gate] 闸门脚本不存在（{_gate}），跳过检查")
+
     # Ensure pod is running AND ComfyUI is actually serving.
     # A freshly-deployed pod (grab_pod.sh / REST create) reports RUNNING
     # immediately but the base pytorch image does NOT auto-launch ComfyUI
@@ -899,6 +950,7 @@ if __name__ == "__main__":
             args.single_model,
             args.end_image,
             num_frames=args.num_frames,
+            morph_lora=args.morph_lora,
         )
         if result:
             downloaded = download_output(result["filename"], args.output_dir)
@@ -917,7 +969,7 @@ if __name__ == "__main__":
                         params={
                             "seed": result["seed"],
                             "lora_strength": args.lora_strength,
-                            "lora_name": "slop_bounce",
+                            "lora_name": args.morph_lora,
                             "width": p["width"],
                             "height": p["height"],
                             "num_frames": p["num_frames"],
