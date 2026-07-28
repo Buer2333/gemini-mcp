@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -114,6 +115,64 @@ PRESETS = {
         "desc": "HD quality (~8min, $0.03)",
     },
 }
+
+
+# --- 机器可读结果协议（plan Phase 0A.2）-------------------------------------
+# NDJSON 事件流，每 job 一个独立文件。未传 --result-json 时 enabled=False，所有
+# emit 均为 no-op —— 默认路径行为逐字节不变。
+#
+# 事件与时点：
+#   submitting      POST 前写入并 fsync（提交意图先落盘，覆盖「响应丢失」窗口）
+#   submitted       拿到 prompt_id 后写入并 fsync，落盘后才进入轮询
+#   remote_completed 拿到 history completed 的 filename 时、下载前
+#   downloaded      下载并校验后（带 sha256）
+#   failed          class=network|business + stage + detail（见 plan 0A.4 三分类）
+class ResultEmitter:
+    def __init__(self, path=None, job_id=None, pod_id=None):
+        self.path = path
+        self.job_id = job_id
+        self.pod_id = pod_id
+        self.enabled = bool(path)
+
+    def emit(self, event, fields=None, fsync=False):
+        if not self.enabled:
+            return None
+        rec = {
+            "event": event,
+            "job_id": self.job_id,
+            "pod_id": self.pod_id,
+            "ts": time.time(),
+        }
+        if fields:
+            rec.update(fields)
+        line = json.dumps(rec, ensure_ascii=False)
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()  # 每条事件写后立即 flush
+            if fsync:
+                os.fsync(f.fileno())  # submitting/submitted 额外 fsync
+        return rec
+
+    def emit_failed(self, err_class, stage, detail):
+        """err_class ∈ {network, business}；stage ∈ {upload, submit_uncertain,
+        submit_rejected, poll, remote, download}（plan 0A.4）。"""
+        return self.emit(
+            "failed",
+            {"class": err_class, "stage": stage, "detail": str(detail)[:500]},
+            fsync=True,
+        )
+
+
+_NULL_EMITTER = ResultEmitter()
+# ---------------------------------------------------------------------------
+
+
+class SubmitUncertain(RuntimeError):
+    """POST /prompt 响应不确定（5xx/408/429/timeout/reset/空/不可解析）。
+
+    plan 0A.4 (c)：不得当作「确定未受理」——远端任务可能已创建。仅在启用
+    --result-json（编排模式）时抛出；默认路径保持原有异常/返回语义。
+    """
 
 
 def get_base_url():
@@ -387,6 +446,7 @@ def build_workflow(
     end_image_name=None,
     num_frames_override=None,
     morph_lora="slop_bounce",
+    filename_prefix=None,
 ):
     _lora_hi, _lora_lo = MORPH_LORAS.get(morph_lora, MORPH_LORAS["slop_bounce"])
     p = PRESETS[preset]
@@ -573,11 +633,12 @@ def build_workflow(
         },
     }
     # Save
+    # filename_prefix：并发产物隔离用（plan 0A.3）。未传时保持现行 `wan22_<preset>`。
     workflow["13"] = {
         "class_type": "SaveAnimatedWEBP",
         "inputs": {
             "images": ["12", 0],
-            "filename_prefix": f"wan22_{preset}",
+            "filename_prefix": filename_prefix or f"wan22_{preset}",
             "fps": 16,
             "lossless": False,
             "quality": 85,
@@ -624,10 +685,14 @@ def generate(
     end_image_path=None,
     num_frames=None,
     morph_lora="slop_bounce",
+    filename_prefix=None,
+    emitter=None,
 ):
     if seed is None:
         seed = int(time.time()) % 2**32
 
+    em = emitter or _NULL_EMITTER
+    output_prefix = filename_prefix or f"wan22_{mode}"
     base = get_base_url()
     preset = PRESETS[mode]
     model_mode = "single" if single_model else "MoE"
@@ -636,14 +701,24 @@ def generate(
     print(f"Seed: {seed}, LoRA strength: {lora_strength}")
 
     # Upload image
+    # plan 0A.4 (a)：上传失败发生在 submitting 之前 → failed{network,upload}，
+    # batch 侧保持 pending 退避重传，不涉及重提风险。异常始终原样上抛（默认路径不变）。
     print("Uploading image...")
-    image_name = upload_image(image_path)
+    try:
+        image_name = upload_image(image_path)
+    except Exception as e:
+        em.emit_failed("network", "upload", f"{type(e).__name__}: {e}")
+        raise
     print(f"  Uploaded: {image_name}")
 
     end_image_name = None
     if end_image_path:
         print("Uploading end image (FLF2V)...")
-        end_image_name = upload_image(end_image_path)
+        try:
+            end_image_name = upload_image(end_image_path)
+        except Exception as e:
+            em.emit_failed("network", "upload", f"{type(e).__name__}: {e}")
+            raise
         print(f"  Uploaded end: {end_image_name}")
 
     # Build and submit
@@ -658,19 +733,65 @@ def generate(
         end_image_name=end_image_name,
         num_frames_override=num_frames,
         morph_lora=morph_lora,
+        filename_prefix=filename_prefix,
     )
     client_id = str(uuid.uuid4())
-    r = requests.post(
-        f"{base}/prompt", json={"prompt": workflow, "client_id": client_id}
+    # 提交意图先落盘并 fsync，然后才 POST（plan 0A.2/0A.4：覆盖「服务端已受理但
+    # 响应丢失」窗口——resume 可按 output_prefix 收养原任务而非并行重提）。
+    em.emit(
+        "submitting",
+        {"output_prefix": output_prefix, "mode": mode, "seed": seed},
+        fsync=True,
     )
-    result = r.json()
+    try:
+        r = requests.post(
+            f"{base}/prompt", json={"prompt": workflow, "client_id": client_id}
+        )
+    except Exception as e:
+        # timeout / connection reset 等传输层异常一律「响应不确定」
+        em.emit_failed("network", "submit_uncertain", f"{type(e).__name__}: {e}")
+        raise
+    # 5xx/408/429 归「响应不确定」：POST 可能已成功，禁止当确定未受理（plan 0A.4 c）。
+    # 仅编排模式（启用 emitter）走此分支，默认路径保持原有 .json() 语义。
+    if em.enabled and (r.status_code in (408, 429) or r.status_code >= 500):
+        detail = f"HTTP {r.status_code}: {str(getattr(r, 'text', ''))[:200]}"
+        em.emit_failed("network", "submit_uncertain", detail)
+        raise SubmitUncertain(detail)
+    try:
+        result = r.json()
+    except Exception as e:
+        # 空响应 / 不可解析响应同属「响应不确定」
+        em.emit_failed(
+            "network", "submit_uncertain", f"unparseable response: {type(e).__name__}"
+        )
+        raise
 
     if result.get("node_errors"):
         print(f"ERROR: {json.dumps(result['node_errors'], indent=2)[:500]}")
+        if not result.get("prompt_id"):
+            # 可解析 + 含 node_errors + 无 prompt_id = 确定未受理（可安全重提）
+            em.emit_failed(
+                "business",
+                "submit_rejected",
+                json.dumps(result["node_errors"], ensure_ascii=False)[:400],
+            )
+        else:
+            # 有 prompt_id 说明远端已建任务 → 不可当确定未受理，交 batch 走收养路径
+            em.emit_failed(
+                "network",
+                "submit_uncertain",
+                f"node_errors with prompt_id {result.get('prompt_id')}",
+            )
         return None
 
     prompt_id = result["prompt_id"]
     print(f"Submitted: {prompt_id}")
+    # submitted 落盘（fsync）后才进入轮询
+    em.emit(
+        "submitted",
+        {"prompt_id": prompt_id, "output_prefix": output_prefix},
+        fsync=True,
+    )
 
     # Poll. range(120)*10s≈1330s was too short for slower 48GB cards: v1 on RTX 6000
     # Ada finished morph at 1258s (barely under), but L40 prod exceeded it -> Timeout
@@ -678,7 +799,8 @@ def generate(
     # ~42min window; env POLL_ROUNDS overrides. Gen still safe on NV /workspace if this
     # ever trips again — recover via scp before terminate.
     t0 = time.time()
-    for i in range(int(os.environ.get("POLL_ROUNDS", "240"))):
+    poll_rounds = int(os.environ.get("POLL_ROUNDS", "240"))
+    for i in range(poll_rounds):
         time.sleep(10)
         try:
             h = (
@@ -695,29 +817,56 @@ def generate(
                         for img in out["images"]:
                             filename = img["filename"]
                             print(f"\nCOMPLETED in {elapsed:.0f}s: {filename}")
+                            # 下载前先落盘 remote_completed：产物已在 NV，
+                            # batch 侧此后只重试下载、不重提（plan 0A.4/0A.5 b）
+                            em.emit(
+                                "remote_completed",
+                                {
+                                    "prompt_id": prompt_id,
+                                    "remote_filename": filename,
+                                    "output_prefix": output_prefix,
+                                },
+                                fsync=True,
+                            )
                             return {
                                 "filename": filename,
                                 "elapsed": elapsed,
                                 "seed": seed,
+                                "prompt_id": prompt_id,
+                                "output_prefix": output_prefix,
                             }
             if st.get("status_str") == "error":
+                _msgs = []
                 for m in st.get("messages", []):
                     if isinstance(m, list) and len(m) > 1 and isinstance(m[1], dict):
                         if "exception_message" in m[1]:
                             print(f"ERROR: {m[1]['exception_message'][:300]}")
+                            _msgs.append(m[1]["exception_message"])
+                # ComfyUI 明确报 error = 业务失败（attempt++，plan 0A.4）
+                em.emit_failed(
+                    "business", "remote", "; ".join(_msgs) or "comfyui status error"
+                )
                 return None
             elapsed = time.time() - t0
             print(f"  [{elapsed:.0f}s] generating...", end="\r")
         except requests.exceptions.Timeout:
             pass
+        except requests.exceptions.RequestException as e:
+            # 轮询期网络错误：runner 退出，batch 侧保持 submitted 不降级（plan 0A.8）
+            em.emit_failed("network", "poll", f"{type(e).__name__}: {e}")
+            raise
     print("Timeout")
+    # 轮询窗口耗尽同样按网络类处理：不得标 terminal failed（plan 0A.5 d）
+    em.emit_failed("network", "poll", f"polling window exhausted ({poll_rounds} rounds)")
     return None
 
 
-def download_output(filename, output_dir="."):
+def download_output(filename, output_dir=".", emitter=None):
+    em = emitter or _NULL_EMITTER
     base = get_base_url()
     url = f"{base}/view?filename={filename}&type=output"
     output_path = os.path.join(output_dir, filename)
+    last_detail = ""
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=60)
@@ -725,14 +874,27 @@ def download_output(filename, output_dir="."):
                 with open(output_path, "wb") as f:
                     f.write(r.content)
                 print(f"Downloaded: {output_path} ({len(r.content) / 1024:.0f}KB)")
+                # sha256 = 下载校验凭据，供 batch 绑定 job/产物（plan 0A.3）
+                em.emit(
+                    "downloaded",
+                    {
+                        "file": os.path.abspath(output_path),
+                        "sha256": hashlib.sha256(r.content).hexdigest(),
+                        "bytes": len(r.content),
+                        "remote_filename": filename,
+                    },
+                    fsync=True,
+                )
                 return output_path
-            print(
-                f"  Download attempt {attempt + 1}: status={r.status_code}, size={len(r.content)}"
-            )
+            last_detail = f"status={r.status_code}, size={len(r.content)}"
+            print(f"  Download attempt {attempt + 1}: {last_detail}")
         except Exception as e:
+            last_detail = f"{type(e).__name__}: {e}"
             print(f"  Download attempt {attempt + 1}: {e}")
         time.sleep(3)
     print(f"FAILED to download {filename} after 3 attempts")
+    # 下载失败为网络类：batch 侧保持 remote_completed 只重下（plan 0A.4/0A.5 l）
+    em.emit_failed("network", "download", last_detail or "download failed")
     return None
 
 
@@ -878,6 +1040,30 @@ if __name__ == "__main__":
         help="Override preset frame count (e.g. 24/48) to right-size a segment and cut "
         "render time; defaults to the mode preset (prod=81). Keeps prod quality.",
     )
+    # --- 编排接口（plan Phase 0A.1-0A.3）；默认不带这些 flag 时行为不变 ---------
+    parser.add_argument(
+        "--orchestrated",
+        action="store_true",
+        help="由 batch 编排器托管 pod 生命周期：跳过 runner 自身的 ensure_auto_stop "
+        "与 finally-stop（pod 的启停/terminate 全部交 wan22_batch.py 决策表）",
+    )
+    parser.add_argument(
+        "--result-json",
+        default=None,
+        help="NDJSON 事件流输出路径（每 job 一个独立文件）。启用后 exit 0 当且仅当 "
+        "产物下载并校验通过",
+    )
+    parser.add_argument(
+        "--job-id",
+        default=os.environ.get("RUNPOD_JOB_ID", ""),
+        help="批次内 job 标识（默认取环境变量 RUNPOD_JOB_ID），写入每条 NDJSON 事件",
+    )
+    parser.add_argument(
+        "--filename-prefix",
+        default=None,
+        help="覆盖 SaveAnimatedWEBP 的 filename_prefix（并发产物隔离，如 "
+        "wan22_<jobid>）；默认保持 wan22_<mode>",
+    )
     args = parser.parse_args()
 
     if args.status:
@@ -937,8 +1123,13 @@ if __name__ == "__main__":
         wait_for_comfyui_ready(timeout=180)
 
     # Deploy auto-stop as backup safety net (won't replace post-gen stop)
-    ensure_auto_stop(idle_minutes=10)
+    # --orchestrated：pod 生命周期交 batch，runner 不装 auto-stop（plan 0A.1）
+    if not args.orchestrated:
+        ensure_auto_stop(idle_minutes=10)
 
+    _emitter = ResultEmitter(args.result_json, args.job_id or None, POD_ID or None)
+    _exit_code = 0
+    downloaded = None
     try:
         result = generate(
             args.prompt,
@@ -951,9 +1142,13 @@ if __name__ == "__main__":
             args.end_image,
             num_frames=args.num_frames,
             morph_lora=args.morph_lora,
+            filename_prefix=args.filename_prefix,
+            emitter=_emitter,
         )
         if result:
-            downloaded = download_output(result["filename"], args.output_dir)
+            downloaded = download_output(
+                result["filename"], args.output_dir, emitter=_emitter
+            )
             # Log to unified AI-gen registry (sidecar JSON + index)
             if _log_generation is not None and downloaded:
                 p = PRESETS[args.mode]
@@ -982,10 +1177,18 @@ if __name__ == "__main__":
                     )
                 except Exception as e:
                     print(f"[logger] log_generation failed (non-fatal): {e}")
+    except Exception as e:
+        # 编排模式：异常已由 generate/download_output 分类落盘为 failed 事件，
+        # 这里只收敛为非零退出码。默认路径（未启用 --result-json）原样上抛。
+        if not _emitter.enabled:
+            raise
+        print(f"[orchestrated] aborted: {type(e).__name__}: {e}")
+        _exit_code = 1
     finally:
         # GUARANTEED pod stop after every generation (pass or fail, or even Ctrl+C)
         # unless user explicitly requests --keep-pod for back-to-back batches
-        if not args.keep_pod:
+        # --orchestrated 时同样跳过：pod 生命周期由 batch 决策表接管（plan 0A.1）
+        if not args.keep_pod and not args.orchestrated:
             print("\n[SAFETY] Stopping pod to prevent runaway cost...")
             try:
                 stop_pod()
@@ -1007,3 +1210,10 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"[ERROR] Failed to stop pod: {e}")
                 print("[ACTION REQUIRED] Run: python3 wan22_generate.py --stop-pod")
+
+    # 机器可读退出码（plan 0A.2）：0 当且仅当产物下载并校验通过。仅在启用
+    # --result-json 时生效，默认路径仍然自然结束（退出码不变）。
+    if _emitter.enabled:
+        if downloaded is None:
+            _exit_code = 1
+        sys.exit(_exit_code)
