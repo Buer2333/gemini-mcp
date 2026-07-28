@@ -26,9 +26,14 @@ prompt/image 外均可选，语义与 wan22_generate.py 的同名 CLI 参数一�
      "morph_lora": "slop_bounce", "num_frames": null, "negative": null,
      "single_model": false, "skip_skin_gate": false, "output_dir": "gen_v2/bounce_red"}
 
+Phase 1.1-1.2（并行扩展）在 0A 内核上加 pod 池：`--pods p1,p2[,p3]` 每 pod 一个
+worker 线程从 job 队列抢活（各自注入 RUNPOD_POD_ID），manifest/ledger 仍单写者；
+决策表按 pod 独立执行——某 pod 干完自己的活立刻 terminate，不等其他 pod。
+
 用法：
     python3 wan22_batch.py --jobs jobs.json --pods <podid> --workdir .batch/run1
-    python3 wan22_batch.py --jobs jobs.json --pods <podid>:borrowed --dry-run
+    python3 wan22_batch.py --jobs jobs.json --pods p1,p2 --workdir .batch/run1
+    python3 wan22_batch.py --jobs jobs.json --pods p1,p2:borrowed --dry-run
     python3 wan22_batch.py --jobs jobs.json --pods <podid> --workdir .batch/run1 --resume
 """
 
@@ -105,6 +110,10 @@ CONFIRM_ROUNDS = 2
 # plan 0A.6：网络中断且 pod 上有已确认运行中任务时的最长等待窗口（单 job 上限 25min + 余量）
 NETWORK_WAIT_WINDOW_SEC = 45 * 60
 DEFAULT_MAX_SPEND = 3.0
+# Phase 1.2 dry-run wall 粗估（分钟）：pilot v2 实测 morph 17-21 / bounce 22-24，
+# 取上界；spinup = grab_pod + ComfyUI 就绪
+JOB_WALL_MIN = {"morph": 21.0, "bounce": 24.0, "test": 7.0}
+POD_SPINUP_MIN = 8.0
 # RTX 6000 Ada $0.77/h（plan 预算表）；API 返回 costPerHr 时以 API 为准
 DEFAULT_POD_RATE = 0.77
 SIGNAL_DRAIN_SEC = 30
@@ -945,12 +954,17 @@ class BatchOrchestrator:
         self.pod_mgr = PodManager(
             self.ledger, self.runpod, self.batch_id, max_spend=max_spend, rate=rate, clock=clock
         )
-        for pid, ownership in self.pods:
-            self.pod_mgr.register(pid, ownership=ownership, worker="w0")
+        # Phase 1.1：每 pod 一个 worker（w0/w1/...），pod 名与 ledger 记录一一对应
+        for idx, (pid, ownership) in enumerate(self.pods):
+            self.pod_mgr.register(pid, ownership=ownership, worker="w%d" % idx)
         self._comfy_factory = comfy_factory or (lambda pod_id: ComfyClient(pod_id))
         self._comfy_cache = {}
+        self._comfy_lock = threading.Lock()
+        self._spend_lock = threading.Lock()
         self.launcher = launcher or SubprocessRunnerLauncher()
         self._shutting_down = False
+        # job 队列：worker 线程从这里抢活（run() 填充；直接调 process_job 时为空）
+        self._queue = queue.Queue()
 
     # -- setup ---------------------------------------------------------------
     def _ensure_batch_id(self, batch_id):
@@ -971,25 +985,40 @@ class BatchOrchestrator:
 
     @staticmethod
     def _parse_pod_specs(pod_specs):
-        """'<podid>' → owned；'<podid>:borrowed' → borrowed（一律不动）。"""
+        """'<podid>' → owned；'<podid>:borrowed' → borrowed（一律不动）。
+
+        Phase 1.1：支持逗号分隔的 pod 池（`--pods p1,p2:borrowed,p3`），空格分隔
+        （0A/0B 用法）继续有效；重复 pod id 去重（一个 pod 只配一个 worker）。
+        """
         out = []
-        for s in pod_specs or []:
-            if ":" in s:
-                pid, own = s.split(":", 1)
-                own = own.strip().lower()
-                out.append((pid.strip(), "borrowed" if own.startswith("b") else "owned"))
-            else:
-                out.append((s.strip(), "owned"))
+        seen = set()
+        for raw in pod_specs or []:
+            for s in str(raw).split(","):
+                s = s.strip()
+                if not s:
+                    continue
+                if ":" in s:
+                    pid, own = s.split(":", 1)
+                    pid = pid.strip()
+                    ownership = "borrowed" if own.strip().lower().startswith("b") else "owned"
+                else:
+                    pid, ownership = s, "owned"
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                out.append((pid, ownership))
         return out
 
     def comfy(self, pod_id):
-        if pod_id not in self._comfy_cache:
-            self._comfy_cache[pod_id] = self._comfy_factory(pod_id)
-        return self._comfy_cache[pod_id]
+        with self._comfy_lock:  # 多 worker 并发取 client，保证每 pod 只建一次
+            if pod_id not in self._comfy_cache:
+                self._comfy_cache[pod_id] = self._comfy_factory(pod_id)
+            return self._comfy_cache[pod_id]
 
     def pod_for(self, job_id):
-        # Phase 0A 单 pod：所有 job 落第一个 pod（Phase 1 才加 pod 池）
-        return self.pods[0][0] if self.pods else None
+        """job 未认领时的兜底 pod（池模式下由 worker 认领时写入 manifest.pod_id）。"""
+        job = self.store.job(job_id)
+        return job.get("pod_id") or (self.pods[0][0] if self.pods else None)
 
     def ownership_of(self, pod_id):
         return self.pod_mgr.pods().get(pod_id, {}).get("ownership", "owned")
@@ -1087,22 +1116,66 @@ class BatchOrchestrator:
         # submit_uncertain → 停留 submitting（由 _reconcile_submitting 收养/确认）
         # poll → 停留 submitted；download → 停留 remote_completed
 
-    # -- 主循环 --------------------------------------------------------------
+    # -- 主循环（Phase 1.1：pod 池 worker 线程）-------------------------------
     def run(self):
         # plan 0A.7 ③：启动/resume 先按名称前缀收养账户里的同批 pod
         self.pod_mgr.adopt_by_name_prefix()
         results = {}
         for jid in self.job_ids:
-            try:
-                results[jid] = self.process_job(jid)
-            except SpendLimitExceeded:
-                raise
+            if self.store.state(jid) == "done":
+                results[jid] = "done"  # resume：已完成的不再入队
+            else:
+                self._queue.put(jid)
+        errors = []
+        pods = self.pods or [(None, "owned")]
+        # 第一个 pod 跑在当前线程：单 pod 时与 0A/0B 完全同路径（含异常直抛语义）
+        threads = [
+            threading.Thread(
+                target=self._worker, args=(pid, results, errors), name="worker-%s" % pid
+            )
+            for pid, _own in pods[1:]
+        ]
+        for t in threads:
+            t.start()
+        self._worker(pods[0][0], results, errors)
+        for t in threads:
+            t.join()
+        if errors:
+            raise errors[0]
         self.finish()
         return results
 
-    def process_job(self, job_id):
+    def _worker(self, pod_id, results, errors):
+        """一个 pod 一个 worker：从队列抢活，队列空后按决策表独立收尾（不等其他 pod）。"""
+        try:
+            while True:
+                try:
+                    job_id = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                results[job_id] = self.process_job(job_id, pod_id=pod_id)
+            self._pod_drained_decision(pod_id)
+        except Exception as e:  # noqa: BLE001 — 交 run() 汇总后重抛
+            errors.append(e)
+
+    def _claim(self, job_id, pod_id):
+        """worker 认领 job：写入 pod_id（单写者）。
+
+        已有 pod_id 且该 pod 仍在池中时保持不变 —— resume 场景下 prompt_id/产物
+        绑在原 pod 的 ComfyUI 上，换 pod 会让 /history 收养失效。
+        """
+        cur = self.store.job(job_id).get("pod_id")
+        if cur and cur in [p for p, _o in self.pods]:
+            return cur
+        self.store.update_job(job_id, pod_id=pod_id, worker_pod=pod_id)
+        return pod_id
+
+    def process_job(self, job_id, pod_id=None):
+        if pod_id is not None:
+            pod_id = self._claim(job_id, pod_id)
         for _round in range(self.max_rounds):
-            self.pod_mgr.check_spend()
+            with self._spend_lock:  # 多 worker 并发时只让一个走清理路径
+                self.pod_mgr.check_spend()
             state = self.store.state(job_id)
             if state == "done":
                 return "done"
@@ -1389,14 +1462,33 @@ class BatchOrchestrator:
 
     # -- plan 0A.6 决策表落地 ------------------------------------------------
     def remaining_jobs_on(self, pod_id):
-        n = 0
+        """该 pod 还可能要干的活 = 已认领未完成的 job + 队列里未认领的 job。
+
+        队列项计入是 Phase 1.1 的关键：任一空闲 worker 都可能抢到它们，
+        队列非空时不能把自己的 pod 关掉（关掉了就没人能接活）。
+        """
+        n = self._queue.qsize()
         for jid in self.job_ids:
             j = self.store.job(jid)
             if j.get("state") in ("done", "business_failed"):
                 continue
-            if (j.get("pod_id") or self.pod_for(jid)) == pod_id:
+            if j.get("pod_id") == pod_id:
                 n += 1
         return n
+
+    def _pod_drained_decision(self, pod_id):
+        """worker 队列抽干后按决策表独立收尾：该 pod 无剩余 job → 立即 terminate，
+        不等其他 pod（plan 0A.6「job 成功且该 pod 无剩余 job」行）。"""
+        if pod_id is None:
+            return "none"
+        action = pod_action(
+            self.ownership_of(pod_id),
+            "job_success",
+            remaining_jobs=self.remaining_jobs_on(pod_id),
+        )
+        if action == "terminate":
+            self.pod_mgr.terminate(pod_id, reason="pod_jobs_drained")
+        return action
 
     def _pod_success_decision(self, job_id, pod_id):
         action = pod_action(
@@ -1483,32 +1575,69 @@ def load_jobs(path):
     return jobs
 
 
+def estimate_job_minutes(spec):
+    """单 job 生成耗时粗估（分钟）。实测口径：morph(FLF2V) ≈21min、bounce ≈24min、
+    test/mid/hd 档 ≈7min（plan Context + Phase 2 verify 的 wall 目标同源）。"""
+    if spec.get("mode", "prod") != "prod":
+        return JOB_WALL_MIN["test"]
+    return JOB_WALL_MIN["morph"] if spec.get("end_image") else JOB_WALL_MIN["bounce"]
+
+
+def plan_allocation(jobs, pods):
+    """把 job 贪心分给当前累计耗时最小的 pod —— 近似 worker 抢活（work-stealing）
+    的实际落点。返回 [(pod_id, ownership, [(job, minutes)], 累计分钟), ...]。"""
+    if not pods:
+        return []
+    buckets = [[p, o, [], 0.0] for p, o in pods]
+    for spec in jobs:
+        mins = estimate_job_minutes(spec)
+        b = min(buckets, key=lambda x: x[3])
+        b[2].append((spec, mins))
+        b[3] += mins
+    return [(b[0], b[1], b[2], b[3]) for b in buckets]
+
+
 def print_allocation(jobs, pods, batch_id, max_spend):
-    print("batch_id=%s  max_spend=$%.2f" % (batch_id, max_spend))
-    print("pods: %s" % (", ".join("%s(%s)" % (p, o) for p, o in pods) or "<none>"))
-    print("%-20s %-8s %-10s %-8s %s" % ("job_id", "mode", "pod", "seed", "output_prefix"))
-    for i, j in enumerate(jobs):
-        pod = pods[i % len(pods)][0] if pods else "-"
-        print(
-            "%-20s %-8s %-10s %-8s %s"
-            % (
-                j["job_id"],
-                j.get("mode", "prod"),
-                pod,
-                j.get("seed", "-"),
-                "wan22_%s" % j["job_id"],
+    print("batch_id=%s  max_spend=$%.2f  jobs=%d  pods=%d" % (batch_id, max_spend, len(jobs), len(pods)))
+    if not pods:
+        print("(no pods given — 无法分配)")
+        return
+    alloc = plan_allocation(jobs, pods)
+    for pod_id, ownership, items, total in alloc:
+        print("")
+        print("pod %s (%s)  jobs=%d  gen≈%.0fmin" % (pod_id, ownership, len(items), total))
+        print("  %-20s %-8s %-8s %-22s %s" % ("job_id", "mode", "seed", "output_prefix", "est"))
+        for spec, mins in items:
+            print(
+                "  %-20s %-8s %-8s %-22s %.0fmin"
+                % (
+                    spec["job_id"],
+                    spec.get("mode", "prod"),
+                    spec.get("seed", "-"),
+                    "wan22_%s" % spec["job_id"],
+                    mins,
+                )
             )
-        )
+        if not items:
+            print("  (idle)")
+    wall = POD_SPINUP_MIN + max(a[3] for a in alloc)
+    print("")
+    print(
+        "预计 wall ≈ spinup %.0fmin + max(pod gen %s) = %.0fmin"
+        % (POD_SPINUP_MIN, "/".join("%.0f" % a[3] for a in alloc), wall)
+    )
+    print("(dry-run：未发任何 API、未创建 pod、未写 manifest)")
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="wan2.2 batch 编排内核（Phase 0A）")
+    ap = argparse.ArgumentParser(description="wan2.2 batch 编排内核（Phase 0A + 1.1/1.2 pod 池）")
     ap.add_argument("--jobs", required=True, help="job 表 JSON 路径")
     ap.add_argument(
         "--pods",
         nargs="+",
         default=[],
-        help="pod 列表：<podid> 视为 owned（batch 可 terminate）；"
+        help="pod 池：逗号或空格分隔（p1,p2:borrowed,p3），每 pod 一个 worker 线程"
+        "从 job 队列抢活。<podid> 视为 owned（batch 可 terminate）；"
         "<podid>:borrowed 一律不动",
     )
     ap.add_argument("--workdir", default=".wan22_batch", help="manifest/ledger/结果目录")

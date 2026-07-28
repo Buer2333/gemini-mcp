@@ -1663,5 +1663,267 @@ class TestRunnerArgvContract(unittest.TestCase):
         self.assertEqual(argv[argv.index("--end-image") + 1], "/e.png")
 
 
+# =============================================================================
+# [Phase 1.1-1.2] pod 池并行 + dry-run 分配表
+# =============================================================================
+class ParallelLauncher(FakeLauncher):
+    """在 FakeLauncher 上加节奏控制：barrier 证明真并行，gate 事件卡住指定 job。"""
+
+    def __init__(self, programs, barrier=None, gates=None):
+        FakeLauncher.__init__(self, programs)
+        self.barrier = barrier
+        self.gates = gates or {}
+        self.lock = threading.Lock()
+
+    def launch(self, job_id, spec, pod_id, ref_path, result_path, output_dir, output_prefix):
+        if self.barrier is not None:
+            self.barrier.wait()  # 两个 worker 必须同时在飞，否则超时 → 测试失败
+        gate = self.gates.get(job_id)
+        if gate is not None:
+            gate.wait(5)
+        return FakeLauncher.launch(
+            self, job_id, spec, pod_id, ref_path, result_path, output_dir, output_prefix
+        )
+
+
+def ok_program(job_id, prompt_id, blob=b"z" * 3000):
+    fn = "wan22_%s_00001.webp" % job_id
+    return {
+        "events": [
+            {"event": "submitting", "output_prefix": "wan22_%s" % job_id},
+            {"event": "submitted", "prompt_id": prompt_id, "output_prefix": "wan22_%s" % job_id},
+            {
+                "event": "remote_completed",
+                "prompt_id": prompt_id,
+                "remote_filename": fn,
+                "output_prefix": "wan22_%s" % job_id,
+            },
+        ],
+        "artifact": (fn, blob),
+        "exit": 0,
+    }
+
+
+class TestPodPoolParallel(OrchBase):
+    """[Phase 1.1] pod 池：每 pod 一个 worker 线程从 job 队列抢活。"""
+
+    def test_two_pods_two_jobs_run_in_parallel_with_distinct_pods(self):
+        jobs = [self.make_job("j1"), self.make_job("j2")]
+        launcher = ParallelLauncher(
+            {"j1": [ok_program("j1", "p1")], "j2": [ok_program("j2", "p2", b"y" * 3000)]},
+            barrier=threading.Barrier(2, timeout=5),
+        )
+        rp = FakeRunPod()
+        orch = self.make_orch(jobs, launcher=launcher, runpod=rp, pods=("pod0,pod1",))
+        results = orch.run()
+        self.assertEqual(results, {"j1": "done", "j2": "done"})
+        used = sorted(l["pod_id"] for l in launcher.launches)
+        self.assertEqual(used, ["pod0", "pod1"])  # 两 job 各落一个 pod
+        self.assertEqual(
+            sorted([orch.store.job("j1")["pod_id"], orch.store.job("j2")["pod_id"]]),
+            ["pod0", "pod1"],
+        )
+        self.assertEqual(sorted(rp.terminated), ["pod0", "pod1"])  # 各自干完各自 terminate
+
+    def test_finished_pod_terminates_without_waiting_for_the_other(self):
+        """[Phase 1.1] 一 pod 完成先 terminate，另一 pod 不受影响。"""
+        jobs = [self.make_job("fast"), self.make_job("slow")]
+        gate = threading.Event()
+        launcher = ParallelLauncher(
+            {"fast": [ok_program("fast", "pf")], "slow": [ok_program("slow", "ps", b"s" * 3000)]},
+            gates={"slow": gate},
+        )
+        rp = FakeRunPod()
+        orch = self.make_orch(jobs, launcher=launcher, runpod=rp, pods=("pod0,pod1",))
+        box = {}
+        t = threading.Thread(target=lambda: box.update(res=orch.run()))
+        t.start()
+        try:
+            deadline = time.time() + 5
+            while time.time() < deadline and orch.store.state("fast") != "done":
+                time.sleep(0.01)
+            self.assertEqual(orch.store.state("fast"), "done")
+            # fast 的 pod 立即 terminate；slow 仍在跑，其 pod 不受影响
+            deadline = time.time() + 5
+            while time.time() < deadline and not rp.terminated:
+                time.sleep(0.01)
+            fast_pod = orch.store.job("fast")["pod_id"]
+            self.assertEqual(rp.terminated, [fast_pod])
+            self.assertNotEqual(orch.store.state("slow"), "done")
+        finally:
+            gate.set()
+            t.join(10)
+        self.assertEqual(box["res"], {"fast": "done", "slow": "done"})
+        self.assertEqual(sorted(rp.terminated), ["pod0", "pod1"])
+
+    def test_subprocess_env_injects_per_pod_ids(self):
+        """[Phase 1.1] 真 launcher 的 env 注入：各 worker 拿到自己的 RUNPOD_POD_ID。"""
+        captured = []
+
+        class FakeSubprocess:
+            @staticmethod
+            def Popen(argv, env=None, **kw):  # noqa: N802 - 模拟 subprocess API
+                captured.append({"argv": argv, "env": env})
+                return FakeProc(0)
+
+        p = Patcher()
+        self.addCleanup(p.undo)
+        p.set(wb, "subprocess", FakeSubprocess)
+        lc = wb.SubprocessRunnerLauncher(runner_path="/x/wan22_generate.py", python_exec="/py")
+        lc.launch("j1", {"prompt": "a", "mode": "prod"}, "podA", "/r/a.png", "/res/j1.ndjson", "/o", "wan22_j1")
+        lc.launch("j2", {"prompt": "b", "mode": "prod"}, "podB", "/r/b.png", "/res/j2.ndjson", "/o", "wan22_j2")
+        self.assertEqual(captured[0]["env"]["RUNPOD_POD_ID"], "podA")
+        self.assertEqual(captured[0]["env"]["RUNPOD_JOB_ID"], "j1")
+        self.assertEqual(captured[1]["env"]["RUNPOD_POD_ID"], "podB")
+        self.assertEqual(captured[1]["env"]["RUNPOD_JOB_ID"], "j2")
+        self.assertIn("--orchestrated", captured[1]["argv"])
+
+    def test_borrowed_pod_in_pool_works_but_is_never_terminated(self):
+        jobs = [self.make_job("j1"), self.make_job("j2")]
+        launcher = ParallelLauncher(
+            {"j1": [ok_program("j1", "p1")], "j2": [ok_program("j2", "p2", b"y" * 3000)]},
+            barrier=threading.Barrier(2, timeout=5),
+        )
+        rp = FakeRunPod()
+        orch = self.make_orch(jobs, launcher=launcher, runpod=rp, pods=("pod0,podB:borrowed",))
+        orch.run()
+        self.assertEqual(rp.terminated, ["pod0"])  # borrowed 一律不动
+        self.assertEqual(sorted(l["pod_id"] for l in launcher.launches), ["podB", "pod0"][::-1])
+
+    def test_three_pods_more_jobs_than_pods_all_complete(self):
+        jobs = [self.make_job("j%d" % i) for i in range(5)]
+        progs = {"j%d" % i: [ok_program("j%d" % i, "p%d" % i, bytes([65 + i]) * 3000)] for i in range(5)}
+        launcher = ParallelLauncher(progs)
+        rp = FakeRunPod()
+        orch = self.make_orch(jobs, launcher=launcher, runpod=rp, pods=("pod0,pod1,pod2",))
+        results = orch.run()
+        self.assertEqual(set(results.values()), {"done"})
+        self.assertEqual(len(launcher.launches), 5)
+        self.assertEqual(sorted(rp.terminated), ["pod0", "pod1", "pod2"])
+        # 每 job 只跑一次、绑定的 pod 属于池内
+        pool = {"pod0", "pod1", "pod2"}
+        for i in range(5):
+            self.assertIn(orch.store.job("j%d" % i)["pod_id"], pool)
+
+    def test_partial_pod_creation_only_cleans_successful_one(self):
+        """[Phase 1.1] 2 pod 其一创建失败 → 只清理成功者（复用 0A.7 机制）。"""
+        ledger = wb.SingleWriterStore(
+            os.path.join(self.tmp, "pods_owned.json"),
+            {"batch_id": "poolbid", "pods": {}, "intents": {}, "alerts": []},
+        )
+        rp = FakeRunPod(create_script=["ok", "no_stock"])
+        mgr = wb.PodManager(ledger, rp, "poolbid", clock=self.clock)
+        got = [mgr.ensure_pod(w, "gpu", "nv", "img") for w in ("w0", "w1")]
+        self.assertIsNotNone(got[0])
+        self.assertIsNone(got[1])
+        # 两个 worker 的 intent 都落盘（防孤儿），但只有一个 pod 进 ledger
+        doc = ledger.snapshot()
+        self.assertEqual(sorted(doc["intents"].keys()), ["w0", "w1"])
+        self.assertEqual(list(doc["pods"].keys()), [got[0]])
+        mgr.cleanup_all("pool_partial")
+        self.assertEqual(rp.terminated, [got[0]])
+
+    def test_queue_size_prevents_premature_terminate(self):
+        """队列还有未认领 job 时，刚完成一单的 pod 不能关（关了没人接活）。"""
+        jobs = [self.make_job("j1"), self.make_job("j2")]
+        orch = self.make_orch(jobs, pods=("pod0",))
+        orch._claim("j1", "pod0")  # worker 认领 j1
+        orch._queue.put("j2")  # j2 仍未认领，排队中
+        self.assertEqual(orch.remaining_jobs_on("pod0"), 2)  # 1 排队 + 1 已认领未完成
+        self.assertEqual(
+            wb.pod_action("owned", "job_success", remaining_jobs=orch.remaining_jobs_on("pod0")),
+            "keep",
+        )
+        # j1 完成后队列里的 j2 仍托着这个 pod，不许提前关
+        orch.store.update_job("j1", state="done")
+        self.assertEqual(orch.remaining_jobs_on("pod0"), 1)
+        self.assertEqual(
+            wb.pod_action("owned", "job_success", remaining_jobs=orch.remaining_jobs_on("pod0")),
+            "keep",
+        )
+        orch._queue.get_nowait()
+        orch.store.update_job("j2", state="done")
+        self.assertEqual(orch.remaining_jobs_on("pod0"), 0)
+        self.assertEqual(
+            wb.pod_action("owned", "job_success", remaining_jobs=orch.remaining_jobs_on("pod0")),
+            "terminate",
+        )
+
+
+class TestPoolCLI(unittest.TestCase):
+    """[Phase 1.2] --pods 逗号解析 + dry-run 分配表/wall 估算（零网络）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wan22p-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_comma_separated_pods_with_ownership_and_dedupe(self):
+        self.assertEqual(
+            wb.BatchOrchestrator._parse_pod_specs(["p1,p2:borrowed,p3"]),
+            [("p1", "owned"), ("p2", "borrowed"), ("p3", "owned")],
+        )
+        # 空格分隔（0A/0B 用法）仍有效，可与逗号混用；重复 id 去重
+        self.assertEqual(
+            wb.BatchOrchestrator._parse_pod_specs(["p1,p2", "p3", "p1"]),
+            [("p1", "owned"), ("p2", "owned"), ("p3", "owned")],
+        )
+        self.assertEqual(wb.BatchOrchestrator._parse_pod_specs(["p1, ,"]), [("p1", "owned")])
+
+    def test_wall_estimate_by_job_kind(self):
+        self.assertEqual(wb.estimate_job_minutes({"mode": "prod", "end_image": "e.png"}), 21.0)
+        self.assertEqual(wb.estimate_job_minutes({"mode": "prod"}), 24.0)
+        self.assertEqual(wb.estimate_job_minutes({"mode": "test"}), 7.0)
+
+    def test_allocation_is_least_loaded_greedy(self):
+        jobs = [
+            {"job_id": "a", "mode": "prod"},
+            {"job_id": "b", "mode": "prod", "end_image": "e.png"},
+            {"job_id": "c", "mode": "test"},
+        ]
+        alloc = wb.plan_allocation(jobs, [("p1", "owned"), ("p2", "owned")])
+        self.assertEqual([a[0] for a in alloc], ["p1", "p2"])
+        self.assertEqual([len(a[2]) for a in alloc], [1, 2])  # 24 vs 21+7
+        self.assertEqual([a[3] for a in alloc], [24.0, 28.0])
+
+    def test_dry_run_prints_per_pod_table_and_wall_without_network(self):
+        import contextlib
+        import io as _io
+
+        class ExplodingRequests:
+            def __getattr__(self, name):
+                raise AssertionError("dry-run must not touch the network (%s)" % name)
+
+        p = Patcher()
+        self.addCleanup(p.undo)
+        p.set(wb, "requests", ExplodingRequests())
+        jobs_path = os.path.join(self.tmp, "jobs.json")
+        with open(jobs_path, "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {"job_id": "bounce_red", "prompt": "x", "image": "a.png", "mode": "prod", "seed": 88},
+                    {"job_id": "morph_blue", "prompt": "y", "image": "b.png",
+                     "end_image": "c.png", "mode": "prod", "seed": 42},
+                ],
+                f,
+            )
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = wb.main(
+                ["--jobs", jobs_path, "--pods", "podA,podB:borrowed", "--dry-run",
+                 "--workdir", os.path.join(self.tmp, "wd")]
+            )
+        out = buf.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("pod podA (owned)", out)
+        self.assertIn("pod podB (borrowed)", out)
+        self.assertIn("bounce_red", out)
+        self.assertIn("wan22_morph_blue", out)
+        self.assertIn("预计 wall", out)
+        self.assertIn("32min", out)  # spinup 8 + max(24, 21)
+        # 未落盘任何状态、未建 workdir
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "wd", "manifest.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "wd", "pods_owned.json")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
