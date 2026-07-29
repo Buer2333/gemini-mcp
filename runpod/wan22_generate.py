@@ -114,6 +114,17 @@ PRESETS = {
         "use_lightx2v": True,
         "desc": "HD quality (~8min, $0.03)",
     },
+    # fast81 (plan Phase 3.2, experimental): 与 prod 同尺寸/同帧数、8 步 + lightx2v 蒸馏，
+    # 专供 bounce 段净 A/B（帧数/步数与 prod 解耦仅剩 lightx2v+步数变量）。
+    # 三闸(肉眼/skin_gate/chroma_qc)全过前不得进产线；morph 段永远 prod（lightx2v 杀 morph 语义）。
+    "fast81": {
+        "width": 480,
+        "height": 832,
+        "num_frames": 81,
+        "steps": 8,
+        "use_lightx2v": True,
+        "desc": "EXPERIMENTAL bounce-only lightx2v A/B (~4min est)",
+    },
 }
 
 
@@ -986,7 +997,7 @@ if __name__ == "__main__":
         help="Optional end frame for FLF2V (first-last-frame). Anchors the morph to end on this image.",
     )
     parser.add_argument(
-        "--mode", "-m", default="test", choices=["test", "mid", "hd", "prod"]
+        "--mode", "-m", default="test", choices=["test", "mid", "hd", "prod", "fast81"]
     )
     parser.add_argument("--seed", "-s", type=int, default=None)
     parser.add_argument("--lora-strength", "-l", type=float, default=0.8)
