@@ -40,8 +40,14 @@ export function registerVideoGenTool(server: McpServer): void {
         .describe(
           'Local file paths to 1-3 reference images. The AI will maintain visual consistency with these images (e.g., product photos, character portraits). Requires Veo 3.1+ model.'
         ),
+      generateAudio: z
+        .boolean()
+        .optional()
+        .describe(
+          'Generate the native audio track (ambience, SFX, spoken dialogue written into the prompt). Veo 3.1 CAN do this, but it was previously unreachable from here — the config simply had no such field, so every clip came out silent and the silence got recorded as "Veo 3.1 has no native audio". Omit to keep the API default.'
+        ),
     },
-    async ({ prompt, model, aspectRatio, negativePrompt, durationSeconds, referenceImagePaths }) => {
+    async ({ prompt, model, aspectRatio, negativePrompt, durationSeconds, referenceImagePaths, generateAudio }) => {
       logger.info(`Starting video generation: ${prompt.substring(0, 50)}...`)
 
       try {
@@ -52,6 +58,7 @@ export function registerVideoGenTool(server: McpServer): void {
           negativePrompt,
           durationSeconds,
           referenceImagePaths,
+          generateAudio,
         })
 
         return {

@@ -465,10 +465,11 @@ export async function startVideoGeneration(
     durationSeconds?: number
     negativePrompt?: string
     referenceImagePaths?: string[]
+    generateAudio?: boolean
   } = {}
 ): Promise<VideoGenerationResult> {
   try {
-    const { modelOverride, aspectRatio = '16:9', negativePrompt, durationSeconds, referenceImagePaths } = options
+    const { modelOverride, aspectRatio = '16:9', negativePrompt, durationSeconds, referenceImagePaths, generateAudio } = options
     const modelToUse = modelOverride || videoModelName
 
     logger.prompt(`Video generation: ${prompt}`)
@@ -481,6 +482,13 @@ export async function startVideoGeneration(
     }
     if (durationSeconds) {
       config.durationSeconds = durationSeconds
+    }
+    // Veo 3.1 does have native audio (dialogue included) — it was simply never
+    // requestable from here, so every clip came back silent and that silence
+    // was written up as a model limitation (2026-08-01, corrected in
+    // skills/video-gen/references/veo-guide.md). Left undefined = API default.
+    if (generateAudio !== undefined) {
+      config.generateAudio = generateAudio
     }
 
     // Build reference images from local file paths (requires Veo 3.1+ or Veo 2.0 exp)
