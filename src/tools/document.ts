@@ -14,6 +14,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
 import { logger } from '../utils/logger.js'
+import { getVideoModelName } from '../utils/models.js'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -85,11 +86,14 @@ export function registerDocumentTool(server: McpServer): void {
         }
 
         const genAI = new GoogleGenAI({ apiKey })
-        const model = process.env.GEMINI_PRO_MODEL || 'gemini-3-pro-preview'
 
         // Read file
         const fileBuffer = fs.readFileSync(filePath)
         const mimeType = getMimeType(filePath)
+        // 视频文件用视频模型（GEMINI_VIDEO_MODEL），其余文档仍用 Pro
+        const model = mimeType.startsWith('video/')
+          ? getVideoModelName()
+          : process.env.GEMINI_PRO_MODEL || 'gemini-3-pro-preview'
         const fileSize = fileBuffer.length
 
         logger.debug(`File size: ${fileSize} bytes, MIME type: ${mimeType}`)

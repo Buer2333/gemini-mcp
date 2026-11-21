@@ -469,7 +469,14 @@ export async function startVideoGeneration(
   } = {}
 ): Promise<VideoGenerationResult> {
   try {
-    const { modelOverride, aspectRatio = '16:9', negativePrompt, durationSeconds, referenceImagePaths, generateAudio } = options
+    const {
+      modelOverride,
+      aspectRatio = '16:9',
+      negativePrompt,
+      durationSeconds,
+      referenceImagePaths,
+      generateAudio,
+    } = options
     const modelToUse = modelOverride || videoModelName
 
     logger.prompt(`Video generation: ${prompt}`)
@@ -704,8 +711,10 @@ export interface DeepResearchResult {
   savedPath?: string // Path to full response JSON file
 }
 
-// Deep Research agent model
-const DEEP_RESEARCH_AGENT = 'deep-research-pro-preview-12-2025'
+// Deep Research agent。2026-11-21 实测旧版 deep-research-pro-preview-12-2025 已被 Google 停用（404 "has been shut down"）。
+// 当前文档版本：deep-research-preview-04-2026（快）/ deep-research-max-preview-04-2026（全面）。
+// GEMINI_DEEP_RESEARCH_AGENT 可覆盖；模型选择真源见 ~/claude-workspace/data/_shared/references/ai-generation-routing.md
+const DEEP_RESEARCH_AGENT = process.env.GEMINI_DEEP_RESEARCH_AGENT || 'deep-research-preview-04-2026'
 
 /**
  * Start a deep research task
