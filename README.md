@@ -82,9 +82,11 @@ Direct queries to Gemini with thinking level control:
 
 ```
 prompt: "Explain quantum entanglement"
-model: "pro" or "flash"
+model: "pro" (default) | "flash" | "video" | "argon" | "carbon" | "hydrogen" | "neon" | any full id, e.g. "gemini-4-neon"
 thinkingLevel: "low" | "medium" | "high" (optional)
 ```
+
+The `model` parameter (also on `gemini-analyze-image`, `gemini-count-tokens`, `gemini-analyze-document` and `gemini-youtube`) takes an alias or any full `gemini-*` model id, passed through as-is (no whitelist, so new models need no code change). `pro`/`flash`/`video` follow `GEMINI_PRO_MODEL` / `GEMINI_FLASH_MODEL` / `GEMINI_VIDEO_MODEL`; `argon`/`carbon`/`hydrogen`/`neon` map to `gemini-4-<name>`. Use `gemini-list-models` (optional `filter`) to list the ids your key can call. The CLI `gcli query -m <model>` accepts the same values.
 
 - **low**: Fast responses, minimal reasoning
 - **medium**: Balanced (Flash only)
@@ -400,6 +402,7 @@ GEMINI_ENABLED_TOOLS=search,image-gen  # Adds to minimal preset
 | `cache` | gemini-create-cache, gemini-query-cache, gemini-list-caches, gemini-delete-cache |
 | `speech` | gemini-speak, gemini-dialogue, gemini-list-voices |
 | `token-count` | gemini-count-tokens |
+| `list-models` | gemini-list-models |
 | `deep-research` | gemini-deep-research, gemini-check-research, gemini-research-followup |
 | `image-analyze` | gemini-analyze-image |
 

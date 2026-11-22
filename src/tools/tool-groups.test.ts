@@ -20,7 +20,7 @@ import { logger } from '../utils/logger.js'
 
 describe('tool-groups', () => {
   describe('TOOL_GROUPS constant', () => {
-    it('should have all 18 tool groups defined', () => {
+    it('should have all 19 tool groups defined', () => {
       const expectedGroups = [
         'query',
         'brainstorm',
@@ -40,9 +40,10 @@ describe('tool-groups', () => {
         'token-count',
         'deep-research',
         'image-analyze',
+        'list-models',
       ]
 
-      expect(Object.keys(TOOL_GROUPS)).toHaveLength(18)
+      expect(Object.keys(TOOL_GROUPS)).toHaveLength(19)
       for (const group of expectedGroups) {
         expect(TOOL_GROUPS).toHaveProperty(group)
       }

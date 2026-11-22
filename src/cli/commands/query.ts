@@ -8,6 +8,7 @@
 import { parseArgs } from 'node:util'
 import { initGeminiClient, generateWithGeminiPro, generateWithGeminiFlash } from '../../gemini-client.js'
 import { setupLogger } from '../../utils/logger.js'
+import { resolveModel } from '../../utils/models.js'
 import { spinner, print, printError, printMuted, t, header } from '../ui/index.js'
 
 function showHelp(): void {
@@ -25,7 +26,7 @@ function showHelp(): void {
     `  ${theme.colors.highlight('--thinking, -t')}  ${theme.colors.muted('Thinking level: minimal, low, medium, high (default: high)')}`
   )
   print(
-    `  ${theme.colors.highlight('--model, -m')}     ${theme.colors.muted('Model to use: pro, flash (default: pro)')}`
+    `  ${theme.colors.highlight('--model, -m')}     ${theme.colors.muted('Model: pro, flash, video, argon, carbon, hydrogen, neon, or a full id like gemini-4-neon (default: pro)')}`
   )
   print(`  ${theme.colors.highlight('--help, -h')}      ${theme.colors.muted('Show this help')}`)
   print('')
@@ -34,6 +35,7 @@ function showHelp(): void {
   print(theme.colors.muted('  gcli query "What is the meaning of life?"'))
   print(theme.colors.muted('  gcli query "Explain quantum computing" --thinking high'))
   print(theme.colors.muted('  gcli query "Quick fact check" -t minimal -m flash'))
+  print(theme.colors.muted('  gcli query "Hard question" -m gemini-4-neon'))
 }
 
 export async function queryCommand(argv: string[]): Promise<void> {
@@ -69,12 +71,13 @@ export async function queryCommand(argv: string[]): Promise<void> {
     process.exit(1)
   }
 
-  // Validate model
-  const validModels = ['pro', 'flash']
+  // Validate model (alias or full id, same rules as the MCP tool)
   const model = values.model as string
-  if (!validModels.includes(model)) {
-    printError(`Invalid model: ${model}`)
-    printMuted(`Valid options: ${validModels.join(', ')}`)
+  let resolvedModel: string
+  try {
+    resolvedModel = resolveModel(model, 'text')
+  } catch (error) {
+    printError(error instanceof Error ? error.message : String(error))
     process.exit(1)
   }
 
@@ -91,12 +94,20 @@ export async function queryCommand(argv: string[]): Promise<void> {
 
     // Query Gemini based on model
     s.update(`Thinking (${thinking})...`)
-    const options = {
+    const options: { thinkingLevel: 'minimal' | 'low' | 'medium' | 'high'; model?: string } = {
       thinkingLevel: thinking as 'minimal' | 'low' | 'medium' | 'high',
     }
 
-    const result =
-      model === 'flash' ? await generateWithGeminiFlash(prompt, options) : await generateWithGeminiPro(prompt, options)
+    const choice = model.trim().toLowerCase()
+    let result: string
+    if (choice === 'flash') {
+      result = await generateWithGeminiFlash(prompt, options)
+    } else if (choice === 'pro') {
+      result = await generateWithGeminiPro(prompt, options)
+    } else {
+      options.model = resolvedModel
+      result = await generateWithGeminiPro(prompt, options)
+    }
 
     s.success('Response received')
     print('')

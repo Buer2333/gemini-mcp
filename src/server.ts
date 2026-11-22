@@ -29,6 +29,7 @@ import { registerSpeechTool } from './tools/speech.js'
 import { registerTokenCountTool } from './tools/token-count.js'
 import { registerDeepResearchTool } from './tools/deep-research.js'
 import { registerImageAnalyzeTool } from './tools/image-analyze.js'
+import { registerListModelsTool } from './tools/list-models.js'
 
 // Import Gemini client and logger
 import { initGeminiClient } from './gemini-client.js'
@@ -170,6 +171,7 @@ For CLI mode, run: gemini --help
       'token-count': registerTokenCountTool,
       'deep-research': registerDeepResearchTool,
       'image-analyze': registerImageAnalyzeTool,
+      'list-models': registerListModelsTool,
     }
 
     // Register tools based on configuration

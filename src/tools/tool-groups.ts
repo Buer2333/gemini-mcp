@@ -52,6 +52,7 @@ export const TOOL_GROUPS: Record<string, { registerFn: string; tools: string[] }
     tools: ['gemini-deep-research', 'gemini-check-research', 'gemini-research-followup'],
   },
   'image-analyze': { registerFn: 'registerImageAnalyzeTool', tools: ['gemini-analyze-image'] },
+  'list-models': { registerFn: 'registerListModelsTool', tools: ['gemini-list-models'] },
 }
 
 // Preset definitions

@@ -13,6 +13,7 @@
 import { GoogleGenAI, Modality } from '@google/genai'
 import { logger } from './utils/logger.js'
 import { ensureOutputDir } from './utils/output-dir.js'
+import { resolveModel } from './utils/models.js'
 import { extractInteractionText, mapInteractionStatus } from './utils/interaction-parse.js'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -31,6 +32,8 @@ export type ThinkingLevel = 'minimal' | 'low' | 'medium' | 'high'
  */
 export interface GenerateOptions {
   thinkingLevel?: ThinkingLevel
+  /** Explicit model id (resolved via resolveModel); overrides the configured Pro/Flash model. */
+  model?: string
 }
 
 /**
@@ -162,12 +165,15 @@ export async function generateWithGeminiPro(prompt: string, options: GenerateOpt
   try {
     logger.prompt(prompt)
 
-    const { thinkingLevel } = options
+    const { thinkingLevel, model } = options
 
     // Build config with optional thinking level
     // Note: Gemini 3 Pro only supports 'low' and 'high' thinking levels
     const config: Record<string, unknown> = {}
-    if (thinkingLevel) {
+    if (thinkingLevel && model) {
+      // Explicit model override: pass the level through unchanged, the API validates it per model
+      config.thinkingConfig = { thinkingLevel }
+    } else if (thinkingLevel) {
       // For Pro, only 'low' and 'high' are valid - map 'minimal' and 'medium' appropriately
       const proThinkingLevel = thinkingLevel === 'minimal' || thinkingLevel === 'low' ? 'low' : 'high'
       config.thinkingConfig = { thinkingLevel: proThinkingLevel }
@@ -175,7 +181,7 @@ export async function generateWithGeminiPro(prompt: string, options: GenerateOpt
     }
 
     const response = await genAI.models.generateContent({
-      model: proModelName,
+      model: model || proModelName,
       contents: prompt,
       config: Object.keys(config).length > 0 ? config : undefined,
     })
@@ -202,7 +208,7 @@ export async function generateWithGeminiFlash(prompt: string, options: GenerateO
   try {
     logger.prompt(prompt)
 
-    const { thinkingLevel } = options
+    const { thinkingLevel, model } = options
 
     // Build config with optional thinking level
     // Note: Gemini 3 Flash supports all thinking levels
@@ -213,7 +219,7 @@ export async function generateWithGeminiFlash(prompt: string, options: GenerateO
     }
 
     const response = await genAI.models.generateContent({
-      model: flashModelName,
+      model: model || flashModelName,
       contents: prompt,
       config: Object.keys(config).length > 0 ? config : undefined,
     })
@@ -686,8 +692,8 @@ export interface TokenCountResult {
 /**
  * Count tokens for content using specified model
  */
-export async function countTokens(content: string, model: 'pro' | 'flash' = 'flash'): Promise<TokenCountResult> {
-  const modelName = model === 'pro' ? proModelName : flashModelName
+export async function countTokens(content: string, model: string = 'flash'): Promise<TokenCountResult> {
+  const modelName = resolveModel(model, 'flash')
 
   const result = await genAI.models.countTokens({
     model: modelName,

@@ -8,6 +8,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { generateWithGeminiPro, generateWithGeminiFlash, type ThinkingLevel } from '../gemini-client.js'
+import { resolveModel, MODEL_PARAM_DESCRIPTION } from '../utils/models.js'
 
 /**
  * Register query tools with the MCP server
@@ -18,7 +19,7 @@ export function registerQueryTool(server: McpServer): void {
     'gemini-query',
     {
       prompt: z.string().describe('The prompt to send to Gemini'),
-      model: z.enum(['pro', 'flash']).default('pro').describe('The Gemini model to use (pro or flash)'),
+      model: z.string().optional().describe(`${MODEL_PARAM_DESCRIPTION} Default: pro`),
       thinkingLevel: z
         .enum(['minimal', 'low', 'medium', 'high'])
         .optional()
@@ -29,16 +30,25 @@ export function registerQueryTool(server: McpServer): void {
     },
     async ({ prompt, model, thinkingLevel }) => {
       console.log(
-        `Querying Gemini ${model} model (thinking: ${thinkingLevel || 'default'}) with prompt: ${prompt.substring(0, 100)}...`
+        `Querying Gemini ${model ?? 'pro'} model (thinking: ${thinkingLevel || 'default'}) with prompt: ${prompt.substring(0, 100)}...`
       )
 
       try {
-        const options = thinkingLevel ? { thinkingLevel: thinkingLevel as ThinkingLevel } : {}
+        const choice = model?.trim().toLowerCase()
+        const options: { thinkingLevel?: ThinkingLevel; model?: string } = thinkingLevel
+          ? { thinkingLevel: thinkingLevel as ThinkingLevel }
+          : {}
 
-        const response =
-          model === 'pro'
-            ? await generateWithGeminiPro(prompt, options)
-            : await generateWithGeminiFlash(prompt, options)
+        let response: string
+        if (!choice || choice === 'pro') {
+          response = await generateWithGeminiPro(prompt, options)
+        } else if (choice === 'flash') {
+          response = await generateWithGeminiFlash(prompt, options)
+        } else {
+          // video / short aliases / full id: resolve (throws a clear error on invalid values)
+          options.model = resolveModel(model, 'text')
+          response = await generateWithGeminiPro(prompt, options)
+        }
 
         // Check for empty response to avoid potential MCP errors
         if (!response || response.trim() === '') {

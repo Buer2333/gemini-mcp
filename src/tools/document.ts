@@ -14,7 +14,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
 import { logger } from '../utils/logger.js'
-import { getVideoModelName } from '../utils/models.js'
+import { resolveModel, MODEL_PARAM_DESCRIPTION } from '../utils/models.js'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -70,8 +70,14 @@ export function registerDocumentTool(server: McpServer): void {
         .describe(
           'Resolution for processing: low (faster, less detail), medium (balanced), high (more detail, more tokens)'
         ),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          `${MODEL_PARAM_DESCRIPTION} Default: GEMINI_VIDEO_MODEL for video files, GEMINI_PRO_MODEL for other documents`
+        ),
     },
-    async ({ filePath, question, mediaResolution }) => {
+    async ({ filePath, question, mediaResolution, model: modelChoice }) => {
       logger.info(`Document analysis: ${filePath}`)
 
       try {
@@ -91,9 +97,7 @@ export function registerDocumentTool(server: McpServer): void {
         const fileBuffer = fs.readFileSync(filePath)
         const mimeType = getMimeType(filePath)
         // 视频文件用视频模型（GEMINI_VIDEO_MODEL），其余文档仍用 Pro
-        const model = mimeType.startsWith('video/')
-          ? getVideoModelName()
-          : process.env.GEMINI_PRO_MODEL || 'gemini-3-pro-preview'
+        const model = resolveModel(modelChoice, mimeType.startsWith('video/') ? 'video' : 'text')
         const fileSize = fileBuffer.length
 
         logger.debug(`File size: ${fileSize} bytes, MIME type: ${mimeType}`)

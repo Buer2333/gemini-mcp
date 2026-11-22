@@ -14,7 +14,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
 import { logger } from '../utils/logger.js'
-import { getVideoModelName } from '../utils/models.js'
+import { resolveModel, MODEL_PARAM_DESCRIPTION } from '../utils/models.js'
 
 /**
  * Parse time string to seconds (supports formats like "1m30s", "90s", "1:30", "90")
@@ -60,8 +60,9 @@ export function registerYouTubeTool(server: McpServer): void {
         ),
       startTime: z.string().optional().describe('Start time for analysis (e.g., "1m30s", "90", "1:30"). Optional.'),
       endTime: z.string().optional().describe('End time for analysis (e.g., "5m00s", "300", "5:00"). Optional.'),
+      model: z.string().optional().describe(`${MODEL_PARAM_DESCRIPTION} Default: video model (GEMINI_VIDEO_MODEL)`),
     },
-    async ({ url, question, startTime, endTime }) => {
+    async ({ url, question, startTime, endTime, model: modelChoice }) => {
       logger.info(`YouTube analysis: ${url.substring(0, 50)}...`)
 
       try {
@@ -76,7 +77,7 @@ export function registerYouTubeTool(server: McpServer): void {
         }
 
         const genAI = new GoogleGenAI({ apiKey })
-        const model = getVideoModelName()
+        const model = resolveModel(modelChoice, 'video')
 
         // Build the video part with optional clipping
         const videoPart: Record<string, unknown> = {

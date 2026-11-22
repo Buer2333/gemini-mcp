@@ -13,6 +13,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { GoogleGenAI } from '@google/genai'
 import { logger } from '../utils/logger.js'
+import { resolveModel, MODEL_PARAM_DESCRIPTION } from '../utils/models.js'
 import * as fs from 'fs'
 import * as path from 'path'
 
@@ -112,9 +113,9 @@ export function registerImageAnalyzeTool(server: McpServer): void {
         .default(true)
         .describe('Enable object detection with bounding boxes (returns box_2d coordinates). Default: true'),
       model: z
-        .enum(['pro', 'flash'])
-        .default('flash')
-        .describe('Model to use: pro (more accurate) or flash (faster). Default: flash'),
+        .string()
+        .optional()
+        .describe(`${MODEL_PARAM_DESCRIPTION} pro is more accurate, flash is faster. Default: flash`),
       thinkingLevel: z
         .enum(['minimal', 'low', 'medium', 'high'])
         .optional()
@@ -145,10 +146,7 @@ export function registerImageAnalyzeTool(server: McpServer): void {
         const dimensions = extractImageDimensions(imagePath)
 
         const genAI = new GoogleGenAI({ apiKey })
-        const modelName =
-          model === 'pro'
-            ? process.env.GEMINI_PRO_MODEL || 'gemini-3-pro-preview'
-            : process.env.GEMINI_FLASH_MODEL || 'gemini-3-flash-preview'
+        const modelName = resolveModel(model, 'flash')
 
         const fileSize = fileBuffer.length
         logger.debug(`Image size: ${fileSize} bytes, MIME type: ${mimeType}`)

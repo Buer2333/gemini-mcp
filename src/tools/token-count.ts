@@ -8,6 +8,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { logger } from '../utils/logger.js'
 import { countTokens } from '../gemini-client.js'
+import { MODEL_PARAM_DESCRIPTION } from '../utils/models.js'
 
 /**
  * Register token counting tool with the MCP server
@@ -18,25 +19,31 @@ export function registerTokenCountTool(server: McpServer): void {
     {
       content: z.string().describe('The text content to count tokens for'),
       model: z
-        .enum(['pro', 'flash'])
-        .default('flash')
-        .describe('Which model to use for counting (affects tokenization)'),
+        .string()
+        .optional()
+        .describe(`Which model to use for counting (affects tokenization). ${MODEL_PARAM_DESCRIPTION} Default: flash`),
     },
-    async ({ content, model = 'flash' }) => {
+    async ({ content, model: modelArg }) => {
+      const model = modelArg?.trim().toLowerCase() || 'flash'
       logger.info(`Counting tokens for ${content.length} characters using ${model} model`)
 
       try {
-        const result = await countTokens(content, model)
+        const result = await countTokens(content, modelArg || 'flash')
         const totalTokens = result.totalTokens
 
         // Estimate costs (approximate, based on typical pricing)
         // Gemini 3 Pro: ~$1.25 per 1M input tokens
         // Gemini 3 Flash: ~$0.075 per 1M input tokens
+        // Only pro/flash have a known rate here; other models are priced differently, so no estimate.
+        const knownRate = model === 'pro' || model === 'flash'
         const costPer1M = model === 'pro' ? 1.25 : 0.075
         const estimatedCost = (totalTokens / 1_000_000) * costPer1M
+        const costLines = knownRate
+          ? `- Input cost: ~$${estimatedCost.toFixed(6)} USD\n- Per 1M tokens: $${costPer1M} (${model})`
+          : `- Cost estimate not available for ${result.modelName} (check the pricing page)`
 
         // Context window info
-        const contextWindow = model === 'pro' ? 1_000_000 : 1_000_000
+        const contextWindow = 1_000_000
         const percentUsed = (totalTokens / contextWindow) * 100
 
         const response = `**Token Count Results**
@@ -53,8 +60,7 @@ export function registerTokenCountTool(server: McpServer): void {
 - Remaining: ${(contextWindow - totalTokens).toLocaleString()} tokens
 
 **Estimated Cost:**
-- Input cost: ~$${estimatedCost.toFixed(6)} USD
-- Per 1M tokens: $${costPer1M} (${model})
+${costLines}
 
 *Note: Actual costs may vary. Check [Google AI pricing](https://ai.google.dev/pricing) for current rates.*`
 

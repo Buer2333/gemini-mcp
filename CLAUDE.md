@@ -23,6 +23,7 @@ This project is an MCP (Model Context Protocol) server that connects Claude to G
 
 1. **Query** (`query.ts`): Direct queries to Gemini with thinking level control
    - `thinkingLevel`: minimal, low, medium, high
+   - `model`: alias (`pro`/`flash`/`video`/`argon`/`carbon`/`hydrogen`/`neon`) or any full `gemini-*` id; resolved by `resolveModel()` in `src/utils/models.ts` (same param on image-analyze, count-tokens, analyze-document, youtube). Unset keeps the old defaults. Find ids with `gemini-list-models`.
 
 2. **Brainstorm** (`brainstorm.ts`): Collaborative brainstorming between Claude and Gemini
 
@@ -103,6 +104,9 @@ This project is an MCP (Model Context Protocol) server that connects Claude to G
       - Structured JSON output with object labels and confidence
       - Thinking level support for complex analysis
       - Handles large files (>20MB) via Files API automatically
+
+19. **List Models** (`list-models.ts`):
+    - `gemini-list-models`: List model ids supporting generateContent (optional `filter` substring)
 
 ## Environment Variables
 
